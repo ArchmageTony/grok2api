@@ -499,6 +499,7 @@ class TokenManager:
         fallback_effort: EffortType = EffortType.LOW,
         consume_on_fail: bool = True,
         is_usage: bool = True,
+        expire_on_blocked_403: bool = False,
     ) -> bool:
         """
         同步 Token 用量
@@ -510,6 +511,7 @@ class TokenManager:
             fallback_effort: 降级时的消耗力度
             consume_on_fail: 失败时是否降级扣费
             is_usage: 是否记录为一次使用（影响 use_count）
+            expire_on_blocked_403: 是否在 403 blocked-user 场景下立即判定失效
 
         Returns:
             是否成功
@@ -589,8 +591,17 @@ class TokenManager:
 
         except Exception as e:
             if isinstance(e, UpstreamException):
-                status = e.details.get("status") if e.details else getattr(e, "status_code", None)
-                is_token_expired = e.details.get("is_token_expired", False) if e.details else False
+                details = e.details if isinstance(e.details, dict) else {}
+                status = details.get("status") if details else getattr(e, "status_code", None)
+                is_token_expired = details.get("is_token_expired", False) if details else False
+                body_text = details.get("body", "") if details else ""
+                if not isinstance(body_text, str):
+                    body_text = str(body_text)
+                body_lower = body_text.lower()
+                blocked_keywords = ["blocked-user", "unauthorized:blocked-user", "bot abuse"]
+                is_blocked_user_403 = status == 403 and any(
+                    keyword in body_lower for keyword in blocked_keywords
+                )
                 
                 if status == 401:
                     # 只要是 401，都应该记录一次失败，增加 fail_count
@@ -605,6 +616,22 @@ class TokenManager:
                             f"Token {raw_token[:10]}...: API sync failed (Confirmed Token Expired), skipping fallback"
                         )
                         return False
+
+                if expire_on_blocked_403 and is_blocked_user_403:
+                    old_status = target_token.status
+                    target_token.record_fail(
+                        status_code=401,
+                        reason="rate_limits_blocked_user_403",
+                        threshold=1,
+                    )
+                    if target_pool_name:
+                        self._track_token_change(target_token, target_pool_name, "state")
+                    self._schedule_save()
+                    logger.error(
+                        f"Token {raw_token[:10]}...: API sync failed (403 blocked-user), "
+                        f"status: {old_status} -> {target_token.status}, skipping fallback"
+                    )
+                    return False
                 
             logger.warning(
                 f"Token {raw_token[:10]}...: API sync failed, error: {e}"
