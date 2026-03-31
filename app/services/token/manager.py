@@ -504,7 +504,7 @@ class TokenManager:
         fallback_effort: EffortType = EffortType.LOW,
         consume_on_fail: bool = True,
         is_usage: bool = True,
-        expire_on_invalid_account: bool = False,
+        expire_on_invalid_account: bool = True,
     ) -> bool:
         """
         同步 Token 用量
