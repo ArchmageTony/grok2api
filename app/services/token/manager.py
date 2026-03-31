@@ -504,7 +504,7 @@ class TokenManager:
         fallback_effort: EffortType = EffortType.LOW,
         consume_on_fail: bool = True,
         is_usage: bool = True,
-        expire_on_blocked_403: bool = False,
+        expire_on_invalid_account: bool = False,
     ) -> bool:
         """
         同步 Token 用量
@@ -516,7 +516,7 @@ class TokenManager:
             fallback_effort: 降级时的消耗力度
             consume_on_fail: 失败时是否降级扣费
             is_usage: 是否记录为一次使用（影响 use_count）
-            expire_on_blocked_403: 是否在 403 blocked-user 场景下立即判定失效
+            expire_on_invalid_account: 是否在命中无效账户规则时立即判定失效（仅手动刷新时开启）
 
         Returns:
             是否成功
@@ -603,11 +603,6 @@ class TokenManager:
                 if not isinstance(body_text, str):
                     body_text = str(body_text)
                 body_lower = body_text.lower()
-                blocked_keywords = ["blocked-user", "unauthorized:blocked-user", "bot abuse"]
-                is_blocked_user_403 = status == 403 and any(
-                    keyword in body_lower for keyword in blocked_keywords
-                )
-                
                 if status == 401:
                     # 只要是 401，都应该记录一次失败，增加 fail_count
                     reason = "rate_limits_auth_failed" if is_token_expired else "rate_limits_auth_unknown"
@@ -622,21 +617,32 @@ class TokenManager:
                         )
                         return False
 
-                if expire_on_blocked_403 and is_blocked_user_403:
-                    old_status = target_token.status
-                    target_token.record_fail(
-                        status_code=401,
-                        reason="rate_limits_blocked_user_403",
-                        threshold=1,
-                    )
-                    if target_pool_name:
-                        self._track_token_change(target_token, target_pool_name, "state")
-                    self._schedule_save()
-                    logger.error(
-                        f"Token {raw_token[:10]}...: API sync failed (403 blocked-user), "
-                        f"status: {old_status} -> {target_token.status}, skipping fallback"
-                    )
-                    return False
+                # 无效账户规则表：(http_status, 关键词, 失败原因, 日志标签)
+                # 新增失效场景只需在此列表中添加一条即可
+                _INVALID_ACCOUNT_RULES = [
+                    (403, "blocked-user", "rate_limits_blocked_user_403", "403 blocked-user"),
+                    (403, "unauthorized:blocked-user", "rate_limits_blocked_user_403", "403 blocked-user"),
+                    (403, "bot abuse", "rate_limits_blocked_user_403", "403 blocked-user"),
+                    (400, "email-domain-rejected", "rate_limits_email_domain_rejected_400", "400 email-domain-rejected"),
+                ]
+
+                if expire_on_invalid_account:
+                    for rule_status, rule_keyword, rule_reason, rule_label in _INVALID_ACCOUNT_RULES:
+                        if status == rule_status and rule_keyword in body_lower:
+                            old_status = target_token.status
+                            target_token.record_fail(
+                                status_code=401,
+                                reason=rule_reason,
+                                threshold=1,
+                            )
+                            if target_pool_name:
+                                self._track_token_change(target_token, target_pool_name, "state")
+                            self._schedule_save()
+                            logger.error(
+                                f"Token {raw_token[:10]}...: API sync failed ({rule_label}), "
+                                f"status: {old_status} -> {target_token.status}, skipping fallback"
+                            )
+                            return False
                 
             logger.warning(
                 f"Token {raw_token[:10]}...: API sync failed, error: {e}"

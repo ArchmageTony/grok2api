@@ -80,7 +80,7 @@ class UsageService:
                 t,
                 consume_on_fail=False,
                 is_usage=False,
-                expire_on_blocked_403=True,
+                expire_on_invalid_account=True,
             )
 
         return await run_batch(
