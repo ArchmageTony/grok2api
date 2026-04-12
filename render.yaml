@@ -11,10 +11,10 @@ services:
         value: Asia/Shanghai
       - key: LOG_LEVEL
         value: INFO
-      - key: SERVER_STORAGE_TYPE
+      - key: ACCOUNT_STORAGE
         value: local
-      - key: SERVER_STORAGE_URL
-        value: ""
+      - key: ACCOUNT_LOCAL_PATH
+        value: data/accounts.db
       - key: SERVER_HOST
         value: 0.0.0.0
       - key: SERVER_PORT
