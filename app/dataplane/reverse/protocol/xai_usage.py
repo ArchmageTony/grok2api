@@ -175,9 +175,19 @@ async def fetch_mode_quota(token: str, mode_id: int) -> object | None:
 
 
 def is_invalid_credentials_body(body: str) -> bool:
-    """Return whether *body* contains the Grok invalid-session marker."""
+    """Return whether *body* contains the Grok invalid-session marker.
+
+    Recognised patterns:
+    - ``invalid-credentials``       — standard session token invalid
+    - ``failed to look up session id`` — session lookup failure
+    - ``email-domain-rejected``     — account email domain blocked (400)
+    """
     text = str(body or "").lower()
-    return "invalid-credentials" in text or "failed to look up session id" in text
+    return (
+        "invalid-credentials" in text
+        or "failed to look up session id" in text
+        or "email-domain-rejected" in text
+    )
 
 
 def is_invalid_credentials_error(exc: BaseException) -> bool:
