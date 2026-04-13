@@ -27,10 +27,12 @@ def _skip_proxy_ssl(proxy_url: str) -> bool:
 
 
 def normalize_proxy_url(url: str) -> str:
-    """Remap socks5:// → socks5h:// for proper DNS-over-proxy."""
+    """Normalize SOCKS schemes for consistent DNS-over-proxy behaviour."""
     if not url:
         return url
     scheme = urlparse(url).scheme.lower()
+    if scheme == "socks":
+        return "socks5h://" + url[len("socks://"):]
     if scheme == "socks5":
         return "socks5h://" + url[len("socks5://"):]
     if scheme == "socks4":

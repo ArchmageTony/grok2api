@@ -19,6 +19,7 @@ from app.control.account.enums import FeedbackKind
 from app.dataplane.reverse.protocol.xai_chat import classify_line, StreamAdapter
 
 from .chat import _stream_chat, _extract_message, _resolve_image, _quota_sync, _fail_sync, _parse_retry_codes, _feedback_kind, _log_task_exception
+from .chat import _configured_retry_codes, _should_retry_upstream
 from ._format import (
     make_resp_id, build_resp_usage, make_resp_object, format_sse,
 )
@@ -183,6 +184,14 @@ def _parse_input(input_val: str | list) -> list[dict]:
                     url = src.get("url", "")
                     if url:
                         normalized.append({"type": "image_url", "image_url": {"url": url}})
+                elif ptype == "input_image":
+                    src = part.get("image_url") or part.get("source") or {}
+                    if isinstance(src, dict):
+                        url = src.get("url", "")
+                    else:
+                        url = str(src or "")
+                    if url:
+                        normalized.append({"type": "image_url", "image_url": {"url": url}})
                 else:
                     normalized.append(part)
             content = normalized
@@ -237,7 +246,7 @@ async def create(
     directory = _acct_dir
 
     max_retries  = cfg.get_int("retry.max_retries", 1)
-    retry_codes  = _parse_retry_codes(cfg.get_str("retry.on_codes", "429,503"))
+    retry_codes  = _configured_retry_codes(cfg)
     response_id  = make_resp_id("resp")
     reasoning_id = make_resp_id("rs")
     message_id   = make_resp_id("msg")
@@ -534,7 +543,7 @@ async def create(
 
                 except UpstreamError as exc:
                     fail_exc = exc
-                    if exc.status in retry_codes and attempt < max_retries:
+                    if _should_retry_upstream(exc, retry_codes) and attempt < max_retries:
                         _retry = True
                         logger.warning("responses stream retry scheduled: attempt={}/{} status={} token={}...",
                                        attempt + 1, max_retries, exc.status, token[:8])
@@ -604,7 +613,7 @@ async def create(
 
             except UpstreamError as exc:
                 fail_exc = exc
-                if exc.status in retry_codes and attempt < max_retries:
+                if _should_retry_upstream(exc, retry_codes) and attempt < max_retries:
                     _retry = True
                     logger.warning("responses retry scheduled: attempt={}/{} status={} token={}...",
                                    attempt + 1, max_retries, exc.status, token[:8])

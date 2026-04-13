@@ -23,7 +23,9 @@ def _normalize_socks(proxy_url: str) -> tuple[str, Optional[bool]]:
     scheme = urlparse(proxy_url).scheme.lower()
     rdns: Optional[bool] = None
     base = scheme
-    if scheme == "socks5h":
+    if scheme == "socks":
+        base, rdns = "socks5", True
+    elif scheme == "socks5h":
         base, rdns = "socks5", True
     elif scheme == "socks4a":
         base, rdns = "socks4", True

@@ -29,6 +29,7 @@ from app.dataplane.reverse.protocol.xai_chat import (
     classify_line,
     StreamAdapter,
 )
+from app.dataplane.reverse.protocol.xai_usage import is_invalid_credentials_error
 from app.dataplane.reverse.runtime.endpoint_table import CHAT
 from app.dataplane.reverse.transport.asset_upload import upload_from_input
 from app.dataplane.reverse.protocol.tool_prompt import (
@@ -91,13 +92,33 @@ async def _fail_sync(
 
 
 def _parse_retry_codes(s: str) -> frozenset[int]:
-    """Parse a comma-separated list of HTTP status codes into a frozenset."""
+    """Parse retry status-code config from either a CSV string or a list."""
     result: set[int] = set()
-    for part in s.split(","):
-        part = part.strip()
-        if part.isdigit():
-            result.add(int(part))
+    parts: list[object]
+    if isinstance(s, str):
+        parts = [part.strip() for part in s.split(",")]
+    elif isinstance(s, (list, tuple, set)):
+        parts = list(s)
+    else:
+        return frozenset()
+    for part in parts:
+        text = str(part).strip()
+        if text.isdigit():
+            result.add(int(text))
     return frozenset(result)
+
+
+def _configured_retry_codes(cfg) -> frozenset[int]:
+    """Read retry codes from current config, including legacy array keys."""
+    raw = cfg.get("retry.on_codes")
+    if raw is None:
+        raw = cfg.get("retry.retry_status_codes", "429,401,503")
+    return _parse_retry_codes(raw)
+
+
+def _should_retry_upstream(exc: UpstreamError, retry_codes: frozenset[int]) -> bool:
+    """Return whether this upstream error should switch to another token."""
+    return exc.status in retry_codes or is_invalid_credentials_error(exc)
 
 
 def _feedback_kind(exc: BaseException) -> "FeedbackKind":
@@ -361,7 +382,7 @@ async def completions(
     directory = _acct_dir
 
     max_retries = cfg.get_int("retry.max_retries", 1)
-    retry_codes = _parse_retry_codes(cfg.get_str("retry.on_codes", "429,503"))
+    retry_codes = _configured_retry_codes(cfg)
     response_id = make_response_id()
     timeout_s = cfg.get_float("chat.timeout", 120.0)
 
@@ -528,7 +549,7 @@ async def completions(
 
                     except UpstreamError as exc:
                         fail_exc = exc
-                        if exc.status in retry_codes and attempt < max_retries:
+                        if _should_retry_upstream(exc, retry_codes) and attempt < max_retries:
                             _retry = True
                             logger.warning(
                                 "chat stream retry scheduled: attempt={}/{} status={} token={}...",
@@ -612,7 +633,7 @@ async def completions(
 
             except UpstreamError as exc:
                 fail_exc = exc
-                if exc.status in retry_codes and attempt < max_retries:
+                if _should_retry_upstream(exc, retry_codes) and attempt < max_retries:
                     _retry = True
                     logger.warning(
                         "chat retry scheduled: attempt={}/{} status={} token={}...",
@@ -710,4 +731,8 @@ async def completions(
     )
 
 
-__all__ = ["completions"]
+__all__ = [
+    "completions",
+    "_configured_retry_codes",
+    "_should_retry_upstream",
+]

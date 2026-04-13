@@ -39,6 +39,7 @@ class ProxyDirectory:
         self._flare           = FlareSolverrClearanceProvider()
         self._egress_mode:    EgressMode    = EgressMode.DIRECT
         self._clearance_mode: ClearanceMode = ClearanceMode.NONE
+        self._config_sig:     tuple | None  = None
         # Pool cursor for PROXY_POOL mode: sticky routing with failure-driven rotate.
         # Incremented on node failure; all callers see the same cursor under _lock.
         self._pool_cursor:    int           = 0
@@ -50,36 +51,73 @@ class ProxyDirectory:
     async def load(self) -> None:
         """Load proxy configuration from the current config snapshot."""
         cfg = get_config()
-        self._egress_mode    = EgressMode(cfg.get_str("proxy.egress.mode", "direct"))
-        self._clearance_mode = ClearanceMode.parse(cfg.get_str("proxy.clearance.mode", "none"))
+        egress_mode = EgressMode(cfg.get_str("proxy.egress.mode", "direct"))
+        clearance_mode = ClearanceMode.parse(cfg.get_str("proxy.clearance.mode", "none"))
+        base_url = cfg.get_str("proxy.egress.proxy_url", "")
+        res_url = cfg.get_str("proxy.egress.resource_proxy_url", "")
+        base_pool = tuple(cfg.get_list("proxy.egress.proxy_pool", []))
+        res_pool = tuple(cfg.get_list("proxy.egress.resource_proxy_pool", []))
+        config_sig = (
+            egress_mode.value,
+            clearance_mode.value,
+            base_url,
+            res_url,
+            base_pool,
+            res_pool,
+            cfg.get_str("proxy.clearance.flaresolverr_url", ""),
+            cfg.get_str("proxy.clearance.cf_cookies", ""),
+            cfg.get_str("proxy.clearance.user_agent", ""),
+            cfg.get_int("proxy.clearance.timeout_sec", 60),
+        )
 
         nodes: list[EgressNode]          = []
         resource_nodes: list[EgressNode] = []
 
-        if self._egress_mode == EgressMode.SINGLE_PROXY:
-            base_url = cfg.get_str("proxy.egress.proxy_url", "")
-            res_url  = cfg.get_str("proxy.egress.resource_proxy_url", "")
+        if egress_mode == EgressMode.SINGLE_PROXY:
             if base_url:
                 nodes.append(EgressNode(node_id="single", proxy_url=base_url))
             if res_url:
                 resource_nodes.append(EgressNode(node_id="res-single", proxy_url=res_url))
 
-        elif self._egress_mode == EgressMode.PROXY_POOL:
-            base_pool: list[str] = cfg.get_list("proxy.egress.proxy_pool", [])
-            res_pool:  list[str] = cfg.get_list("proxy.egress.resource_proxy_pool", [])
+        elif egress_mode == EgressMode.PROXY_POOL:
             for i, url in enumerate(base_pool):
                 nodes.append(EgressNode(node_id=f"pool-{i}", proxy_url=url))
             for i, url in enumerate(res_pool):
                 resource_nodes.append(EgressNode(node_id=f"res-pool-{i}", proxy_url=url))
 
+        valid_affinities = {
+            n.proxy_url or "direct"
+            for n in [*nodes, *resource_nodes]
+        }
+        if not valid_affinities:
+            valid_affinities = {"direct"}
+
         async with self._lock:
+            if self._config_sig == config_sig:
+                return
+            from .models import ClearanceBundleState
+
+            self._egress_mode    = egress_mode
+            self._clearance_mode = clearance_mode
             self._nodes          = nodes
             self._resource_nodes = resource_nodes
+            self._pool_cursor    = 0
+            self._bundles = {
+                key: bundle.model_copy(update={"state": ClearanceBundleState.INVALID})
+                for key, bundle in self._bundles.items()
+                if key in valid_affinities
+            }
+            self._refresh_events = {
+                key: event
+                for key, event in self._refresh_events.items()
+                if key in valid_affinities
+            }
+            self._config_sig = config_sig
 
         logger.info(
             "proxy directory loaded: egress_mode={} clearance_mode={} node_count={} resource_node_count={}",
-            self._egress_mode,
-            self._clearance_mode,
+            egress_mode,
+            clearance_mode,
             len(nodes),
             len(resource_nodes),
         )
@@ -326,11 +364,11 @@ _directory: ProxyDirectory | None = None
 
 
 async def get_proxy_directory() -> ProxyDirectory:
-    """Return the module-level ProxyDirectory, loading config on first call."""
+    """Return the module-level ProxyDirectory, reloading config if it changed."""
     global _directory
     if _directory is None:
         _directory = ProxyDirectory()
-        await _directory.load()
+    await _directory.load()
     return _directory
 
 

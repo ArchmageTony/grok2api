@@ -30,6 +30,7 @@ from app.dataplane.reverse.protocol.tool_parser import parse_tool_calls
 from app.products.openai.chat import (
     _stream_chat, _extract_message, _resolve_image,
     _quota_sync, _fail_sync, _parse_retry_codes, _feedback_kind, _log_task_exception,
+    _configured_retry_codes, _should_retry_upstream,
 )
 from app.products.openai._tool_sieve import ToolSieve
 
@@ -308,7 +309,7 @@ async def create(
     directory = _acct_dir
 
     max_retries = cfg.get_int("retry.max_retries", 1)
-    retry_codes = _parse_retry_codes(cfg.get_str("retry.on_codes", "429,503"))
+    retry_codes = _configured_retry_codes(cfg)
     timeout_s   = cfg.get_float("chat.timeout", 120.0)
     msg_id      = _make_msg_id()
 
@@ -572,7 +573,7 @@ async def create(
 
                 except UpstreamError as exc:
                     fail_exc = exc
-                    if exc.status in retry_codes and attempt < max_retries:
+                    if _should_retry_upstream(exc, retry_codes) and attempt < max_retries:
                         _retry = True
                         logger.warning(
                             "messages stream retry: attempt={}/{} status={} token={}...",
@@ -649,7 +650,7 @@ async def create(
 
             except UpstreamError as exc:
                 fail_exc = exc
-                if exc.status in retry_codes and attempt < max_retries:
+                if _should_retry_upstream(exc, retry_codes) and attempt < max_retries:
                     _retry = True
                     logger.warning(
                         "messages retry: attempt={}/{} status={} token={}...",

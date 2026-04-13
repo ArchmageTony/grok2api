@@ -40,8 +40,8 @@ _runtime: ProxyRuntime | None = None
 
 async def get_proxy_runtime() -> ProxyRuntime:
     global _runtime
+    directory = await get_proxy_directory()
     if _runtime is None:
-        directory = await get_proxy_directory()
         _runtime  = ProxyRuntime(directory)
     return _runtime
 
