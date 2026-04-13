@@ -24,10 +24,10 @@ _MODE_NAMES: dict[int, str] = {
 
 # Default window durations used as fallback when API call fails.
 _DEFAULT_WINDOW_SECS: dict[int, int] = {
-    0: 72_000,   # auto   — 20 h (basic) / 2 h (super/heavy, real value overrides)
-    1: 72_000,   # fast   — 20 h (basic)
-    2: 36_000,   # expert — 10 h (basic)
-    3:  7_200,   # heavy  — 2 h  (heavy-pool only)
+    0: 72_000,  # auto   — 20 h (basic) / 2 h (super/heavy, real value overrides)
+    1: 72_000,  # fast   — 20 h (basic)
+    2: 36_000,  # expert — 10 h (basic)
+    3: 7_200,  # heavy  — 2 h  (heavy-pool only)
 }
 
 
@@ -39,6 +39,7 @@ def _build_payload(mode_name: str) -> bytes:
 # ---------------------------------------------------------------------------
 # Response parser
 # ---------------------------------------------------------------------------
+
 
 def parse_rate_limits(body: dict) -> dict | None:
     """Parse flat rate-limits response.
@@ -59,11 +60,11 @@ def parse_rate_limits(body: dict) -> dict | None:
     remaining = body.get("remainingQueries")
     if remaining is None:
         return None
-    total       = body.get("totalQueries")
+    total = body.get("totalQueries")
     window_secs = body.get("windowSizeSeconds")
     return {
-        "remaining":      int(remaining),
-        "total":          int(total) if total is not None else int(remaining),
+        "remaining": int(remaining),
+        "total": int(total) if total is not None else int(remaining),
         "window_seconds": int(window_secs) if window_secs else 72_000,
     }
 
@@ -72,24 +73,26 @@ def parse_rate_limits(body: dict) -> dict | None:
 # QuotaWindow builder
 # ---------------------------------------------------------------------------
 
+
 def _to_quota_window(data: dict, synced_at: int) -> object:
     from app.control.account.models import QuotaWindow
     from app.control.account.enums import QuotaSource
 
     ws = data["window_seconds"]
     return QuotaWindow(
-        remaining      = data["remaining"],
-        total          = data["total"],
-        window_seconds = ws,
-        reset_at       = synced_at + ws * 1000,   # estimated end of current window
-        synced_at      = synced_at,
-        source         = QuotaSource.REAL,
+        remaining=data["remaining"],
+        total=data["total"],
+        window_seconds=ws,
+        reset_at=synced_at + ws * 1000,  # estimated end of current window
+        synced_at=synced_at,
+        source=QuotaSource.REAL,
     )
 
 
 # ---------------------------------------------------------------------------
 # HTTP fetch
 # ---------------------------------------------------------------------------
+
 
 async def _do_fetch(token: str, mode_name: str) -> dict:
     """POST the rate-limits endpoint for one mode and return parsed JSON body."""
@@ -104,20 +107,16 @@ async def _do_fetch(token: str, mode_name: str) -> dict:
             "https://grok.com/rest/rate-limits",
             token,
             _build_payload(mode_name),
-            lease     = lease,
-            timeout_s = 20.0,
+            lease=lease,
+            timeout_s=20.0,
         )
-        await proxy.feedback(lease, ProxyFeedback(kind=ProxyFeedbackKind.SUCCESS, status_code=200))
+        await proxy.feedback(
+            lease, ProxyFeedback(kind=ProxyFeedbackKind.SUCCESS, status_code=200)
+        )
         return body
     except Exception as exc:
         status = getattr(exc, "status", None) or getattr(exc, "status_code", None)
-        kind = (
-            ProxyFeedbackKind.RATE_LIMITED  if status == 429 else
-            ProxyFeedbackKind.CHALLENGE     if status == 403 else
-            ProxyFeedbackKind.UNAUTHORIZED  if status == 401 else
-            ProxyFeedbackKind.UPSTREAM_5XX  if status and status >= 500 else
-            ProxyFeedbackKind.TRANSPORT_ERROR
-        )
+        kind = _proxy_feedback_kind_for_error(exc, status=status)
         await proxy.feedback(lease, ProxyFeedback(kind=kind, status_code=status))
         raise
 
@@ -128,17 +127,29 @@ async def _fetch_one(token: str, mode_id: int) -> object | None:
     try:
         body = await asyncio.wait_for(_do_fetch(token, mode_name), timeout=25.0)
     except asyncio.TimeoutError:
-        logger.debug("rate-limits fetch timed out: token={}... mode={}", token[:10], mode_name)
+        logger.debug(
+            "rate-limits fetch timed out: token={}... mode={}", token[:10], mode_name
+        )
         return None
     except Exception as exc:
         if is_invalid_credentials_error(exc):
             raise
-        logger.debug("rate-limits fetch failed: token={}... mode={} error={}", token[:10], mode_name, exc)
+        logger.debug(
+            "rate-limits fetch failed: token={}... mode={} error={}",
+            token[:10],
+            mode_name,
+            exc,
+        )
         return None
 
     data = parse_rate_limits(body)
     if data is None:
-        logger.debug("rate-limits response missing quota fields: token={}... mode={} body={}", token[:10], mode_name, body)
+        logger.debug(
+            "rate-limits response missing quota fields: token={}... mode={} body={}",
+            token[:10],
+            mode_name,
+            body,
+        )
         return None
 
     return _to_quota_window(data, now_ms())
@@ -148,7 +159,10 @@ async def _fetch_one(token: str, mode_id: int) -> object | None:
 # Public API
 # ---------------------------------------------------------------------------
 
-async def fetch_all_quotas(token: str, mode_ids: tuple[int, ...] | None = None) -> dict[int, object] | None:
+
+async def fetch_all_quotas(
+    token: str, mode_ids: tuple[int, ...] | None = None
+) -> dict[int, object] | None:
     """Fetch quota windows for the requested modes concurrently.
 
     ``mode_ids`` defaults to ``(0, 1, 2, 3)``. Returns ``{mode_id: QuotaWindow}``
@@ -156,8 +170,11 @@ async def fetch_all_quotas(token: str, mode_ids: tuple[int, ...] | None = None) 
     mode failed.
     """
     import asyncio
+
     requested = mode_ids or (0, 1, 2, 3)
-    results = await asyncio.gather(*(_fetch_one(token, mode_id) for mode_id in requested), return_exceptions=True)
+    results = await asyncio.gather(
+        *(_fetch_one(token, mode_id) for mode_id in requested), return_exceptions=True
+    )
     for result in results:
         if isinstance(result, Exception) and is_invalid_credentials_error(result):
             raise result
@@ -175,28 +192,51 @@ async def fetch_mode_quota(token: str, mode_id: int) -> object | None:
 
 
 def is_invalid_credentials_body(body: str) -> bool:
-    """Return whether *body* contains the Grok invalid-session marker.
-
-    Recognised patterns:
-    - ``invalid-credentials``       — standard session token invalid
-    - ``failed to look up session id`` — session lookup failure
-    - ``email-domain-rejected``     — account email domain blocked (400)
-    """
+    """Return whether *body* contains a Grok invalid/blocked account marker."""
     text = str(body or "").lower()
     return (
         "invalid-credentials" in text
+        or "bad-credentials" in text
         or "failed to look up session id" in text
+        or "blocked-user" in text
         or "email-domain-rejected" in text
+        or "session not found" in text
+        or "account suspended" in text
+        or "token revoked" in text
+        or "token expired" in text
     )
 
 
 def is_invalid_credentials_error(exc: BaseException) -> bool:
-    """Return whether *exc* is the Grok invalid-session credential failure."""
+    """Return whether *exc* indicates the account is invalid or blocked."""
     if not isinstance(exc, UpstreamError):
         return False
-    if exc.status != 400:
+    if exc.status not in (400, 401, 403):
         return False
     return is_invalid_credentials_body(str(exc.details.get("body", "") or ""))
+
+
+def _proxy_feedback_kind_for_error(
+    exc: BaseException,
+    *,
+    status: int | None,
+):
+    """Map quota-fetch failures to proxy feedback without burning healthy clearance."""
+    from app.control.proxy.models import ProxyFeedbackKind
+
+    # Invalid or blocked accounts are account problems, not proxy problems.
+    if is_invalid_credentials_error(exc):
+        return ProxyFeedbackKind.FORBIDDEN
+
+    if status == 429:
+        return ProxyFeedbackKind.RATE_LIMITED
+    if status == 403:
+        return ProxyFeedbackKind.CHALLENGE
+    if status == 401:
+        return ProxyFeedbackKind.UNAUTHORIZED
+    if status and status >= 500:
+        return ProxyFeedbackKind.UPSTREAM_5XX
+    return ProxyFeedbackKind.TRANSPORT_ERROR
 
 
 __all__ = [

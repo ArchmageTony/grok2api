@@ -24,7 +24,13 @@ MODELS: tuple[ModelSpec, ...] = (
     ModelSpec("grok-4.20-0309-heavy",                   ModeId.AUTO,   Tier.HEAVY, Capability.CHAT,       True, "Grok 4.20 0309 Heavy"),
     ModelSpec("grok-4.20-0309-reasoning-heavy",         ModeId.EXPERT, Tier.HEAVY, Capability.CHAT,       True, "Grok 4.20 0309 Reasoning Heavy"),
     ModelSpec("grok-4.20-multi-agent-0309",             ModeId.HEAVY,  Tier.HEAVY, Capability.CHAT,       True, "Grok 4.20 Multi-Agent 0309"),
-    
+
+    # --- 硬优先级反向选池 (heavy → super → basic) ---
+    ModelSpec("grok-4.20-fast",                        ModeId.FAST,   Tier.BASIC, Capability.CHAT,       True, "Grok 4.20 Fast",          prefer_best=True),
+    ModelSpec("grok-4.20-auto",                        ModeId.AUTO,   Tier.BASIC, Capability.CHAT,       True, "Grok 4.20 Auto",          prefer_best=True),
+    ModelSpec("grok-4.20-expert",                      ModeId.EXPERT, Tier.BASIC, Capability.CHAT,       True, "Grok 4.20 Expert",        prefer_best=True),
+    ModelSpec("grok-4.20-heavy",                       ModeId.HEAVY,  Tier.HEAVY, Capability.CHAT,       True, "Grok 4.20 Heavy",         prefer_best=True),
+
     # === Image ==============================================================
 
     # Basic+

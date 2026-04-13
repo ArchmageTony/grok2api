@@ -179,6 +179,10 @@ docker compose up -d
 | `ACCOUNT_REDIS_URL` | Redis DSN for `redis` mode | `""` |
 | `ACCOUNT_MYSQL_URL` | SQLAlchemy DSN for `mysql` mode | `""` |
 | `ACCOUNT_POSTGRESQL_URL` | SQLAlchemy DSN for `postgresql` mode | `""` |
+| `ACCOUNT_SQL_POOL_SIZE` | Core connection pool size for SQL backends | `5` |
+| `ACCOUNT_SQL_MAX_OVERFLOW` | Maximum overflow connections above pool size | `10` |
+| `ACCOUNT_SQL_POOL_TIMEOUT` | Seconds to wait for a free connection from the pool | `30` |
+| `ACCOUNT_SQL_POOL_RECYCLE` | Max connection lifetime in seconds before reconnect | `1800` |
 
 ### System Configuration Groups
 

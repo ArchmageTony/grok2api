@@ -29,10 +29,17 @@ class SqlConfigBackend(ConfigBackend):
     Version token is stored as the integer value of the ``__version__`` row.
     """
 
-    def __init__(self, engine: AsyncEngine, *, dialect: str = "postgresql") -> None:
+    def __init__(
+        self,
+        engine: AsyncEngine,
+        *,
+        dialect: str = "postgresql",
+        dispose_engine: bool = True,
+    ) -> None:
         self._engine  = engine
         self._dialect = dialect  # "mysql" | "postgresql"
         self._ready   = False
+        self._dispose_engine = dispose_engine
 
     async def _ensure_table(self) -> None:
         if self._ready:
@@ -117,4 +124,7 @@ class SqlConfigBackend(ConfigBackend):
             )
 
     async def close(self) -> None:
-        await self._engine.dispose()
+        if self._dispose_engine:
+            from app.control.account.backends.sql import _evict_cached_engine
+            _evict_cached_engine(self._engine)
+            await self._engine.dispose()

@@ -8,12 +8,13 @@ from ..shared.enums import ALL_MODE_IDS, StatusId
 from .table import AccountRuntimeTable
 
 # Health adjustment constants.
-_SUCCESS_STEP       = 0.12
-_AUTH_FACTOR        = 0.55
-_FORBIDDEN_FACTOR   = 0.25
-_RATE_LIMIT_FACTOR  = 0.45
-_MIN_HEALTH         = 0.05
-_MAX_HEALTH         = 1.0
+_SUCCESS_STEP = 0.12
+_AUTH_FACTOR = 0.55
+_FORBIDDEN_FACTOR = 0.25
+_RATE_LIMIT_FACTOR = 0.45
+_SERVER_ERROR_FACTOR = 0.75
+_MIN_HEALTH = 0.05
+_MAX_HEALTH = 1.0
 
 
 def apply_success(table: AccountRuntimeTable, idx: int, mode_id: int) -> None:
@@ -29,7 +30,7 @@ def apply_success(table: AccountRuntimeTable, idx: int, mode_id: int) -> None:
     # Remove from availability index if quota exhausted.
     if new_q == 0:
         pool_id = int(table.pool_by_idx[idx])
-        bucket  = table.mode_available.get((pool_id, mode_id))
+        bucket = table.mode_available.get((pool_id, mode_id))
         if bucket:
             bucket.discard(idx)
 
@@ -39,7 +40,7 @@ def apply_rate_limited(table: AccountRuntimeTable, idx: int, mode_id: int) -> No
     table._quota_col(mode_id)[idx] = 0
     _adjust_health(table, idx, _RATE_LIMIT_FACTOR)
     pool_id = int(table.pool_by_idx[idx])
-    bucket  = table.mode_available.get((pool_id, mode_id))
+    bucket = table.mode_available.get((pool_id, mode_id))
     if bucket:
         bucket.discard(idx)
 
@@ -54,9 +55,16 @@ def apply_forbidden(table: AccountRuntimeTable, idx: int) -> None:
     _adjust_health(table, idx, _FORBIDDEN_FACTOR)
 
 
-def apply_status_change(table: AccountRuntimeTable, idx: int, new_status_id: int) -> None:
+def apply_server_error(table: AccountRuntimeTable, idx: int) -> None:
+    """Mildly reduce health on 5xx / transport errors."""
+    _adjust_health(table, idx, _SERVER_ERROR_FACTOR)
+
+
+def apply_status_change(
+    table: AccountRuntimeTable, idx: int, new_status_id: int
+) -> None:
     """Update status column and refresh availability indexes."""
-    pool_id    = int(table.pool_by_idx[idx])
+    pool_id = int(table.pool_by_idx[idx])
     old_status = int(table.status_by_idx[idx])
 
     if old_status == new_status_id:
@@ -78,11 +86,11 @@ def apply_status_change(table: AccountRuntimeTable, idx: int, new_status_id: int
 
 
 def apply_quota_update(
-    table:    AccountRuntimeTable,
-    idx:      int,
-    mode_id:  int,
+    table: AccountRuntimeTable,
+    idx: int,
+    mode_id: int,
     remaining: int,
-    reset_s:  int,
+    reset_s: int,
 ) -> None:
     """Update quota and reset timestamp from upstream API data."""
     quota_col = table._quota_col(mode_id)
@@ -113,12 +121,13 @@ def update_last_use(table: AccountRuntimeTable, idx: int, now_s: int) -> None:
 
 def update_last_fail(table: AccountRuntimeTable, idx: int, now_s: int) -> None:
     table.last_fail_at_by_idx[idx] = now_s
-    table.fail_count_by_idx[idx]   = min(int(table.fail_count_by_idx[idx]) + 1, 65535)
+    table.fail_count_by_idx[idx] = min(int(table.fail_count_by_idx[idx]) + 1, 65535)
 
 
 # ---------------------------------------------------------------------------
 # Internal
 # ---------------------------------------------------------------------------
+
 
 def _adjust_health(table: AccountRuntimeTable, idx: int, factor: float) -> None:
     h = max(_MIN_HEALTH, float(table.health_by_idx[idx]) * factor)
@@ -130,6 +139,7 @@ __all__ = [
     "apply_rate_limited",
     "apply_auth_failure",
     "apply_forbidden",
+    "apply_server_error",
     "apply_status_change",
     "apply_quota_update",
     "increment_inflight",

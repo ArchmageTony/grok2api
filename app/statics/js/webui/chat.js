@@ -40,6 +40,8 @@
   let activeEdit = null;
   const PROMPT_MIN_HEIGHT = 36;
   const PROMPT_MAX_HEIGHT = 108;
+  let pendingThreadScrollFrame = 0;
+  let sessionListRenderSignature = '';
 
   function text(key, fallback, params) {
     if (typeof window.t !== 'function') return fallback;
@@ -77,6 +79,11 @@
 
   function hasVisibleReasoning(value) {
     return typeof value === 'string' && value.trim().length > 0;
+  }
+
+  function hasMessageContent(value) {
+    const textValue = typeof value === 'string' ? value : extractTextContent(value);
+    return Boolean((textValue || '').trim());
   }
 
   function sanitizeUrl(value) {
@@ -236,13 +243,51 @@
     return html.join('') || '<p></p>';
   }
 
+  function _extractMath(source) {
+    const placeholders = [];
+    // Display math: $$...$$ (must come before inline to avoid double-match)
+    let out = source.replace(/\$\$([\s\S]+?)\$\$/g, (_, tex) => {
+      const i = placeholders.length;
+      placeholders.push({ tex, display: true });
+      return `\x02MATH${i}\x03`;
+    });
+    // Inline math: $...$  (single-line only, no space at edges to avoid false positives)
+    out = out.replace(/\$([^\n$]+?)\$/g, (_, tex) => {
+      const i = placeholders.length;
+      placeholders.push({ tex, display: false });
+      return `\x02MATH${i}\x03`;
+    });
+    return { out, placeholders };
+  }
+
   function renderRichMarkdown(source) {
     if (window.marked && typeof window.marked.parse === 'function') {
-      const rendered = window.marked.parse(normalizeMediaContent(source), {
+      let toRender = normalizeMediaContent(source);
+      let placeholders = [];
+
+      if (window.katex) {
+        const extracted = _extractMath(toRender);
+        toRender = extracted.out;
+        placeholders = extracted.placeholders;
+      }
+
+      let rendered = window.marked.parse(toRender, {
         async: false,
         breaks: true,
         gfm: true,
       });
+
+      if (window.katex && placeholders.length) {
+        rendered = rendered.replace(/\x02MATH(\d+)\x03/g, (_, idx) => {
+          const { tex, display } = placeholders[parseInt(idx, 10)];
+          try {
+            return window.katex.renderToString(tex, { displayMode: display, throwOnError: false });
+          } catch (_e) {
+            return escapeHtml(display ? `$$${tex}$$` : `$${tex}$`);
+          }
+        });
+      }
+
       return sanitizeRenderedHtml(rendered);
     }
     return renderMarkdown(source);
@@ -675,7 +720,11 @@
   }
 
   function scrollThread() {
-    thread.scrollTop = thread.scrollHeight;
+    if (pendingThreadScrollFrame) return;
+    pendingThreadScrollFrame = window.requestAnimationFrame(() => {
+      pendingThreadScrollFrame = 0;
+      thread.scrollTop = thread.scrollHeight;
+    });
   }
 
   function hideEmpty() {
@@ -878,7 +927,7 @@
   function createMessage(role, initialText = '', initialReasoning = '', messageIndex = -1) {
     hideEmpty();
     const hasReasoning = role === 'assistant' && hasVisibleReasoning(initialReasoning);
-    const isAssistantWaiting = role === 'assistant' && messageIndex < 0 && !hasReasoning && typeof initialText === 'string' && !initialText.trim();
+    const isAssistantWaiting = role === 'assistant' && messageIndex < 0 && !hasReasoning && !hasMessageContent(initialText);
 
     const wrap = document.createElement('div');
     wrap.className = `msg ${role}`;
@@ -959,6 +1008,21 @@
       renderMessageContent(card, role, initialText);
     }
 
+    const entry = {
+      wrap,
+      reasoning,
+      reasoningBody,
+      card,
+      text: initialText,
+      reasoningText: initialReasoning,
+      waiting: isAssistantWaiting,
+      messageIndex,
+      actions: null,
+      likeBtn: null,
+      dislikeBtn: null,
+      renderFrame: 0,
+    };
+
     if (role === 'assistant') {
       wrap.appendChild(reasoning);
     }
@@ -1016,7 +1080,7 @@
       regenBtn.setAttribute('title', text('webui.chat.regenerate', 'Regenerate'));
       regenBtn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M21 2v6h-6" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/><path d="M3 11a9 9 0 0 1 15.3-6.3L21 8" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/><path d="M3 22v-6h6" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/><path d="M21 13a9 9 0 0 1-15.3 6.3L3 16" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>';
       regenBtn.addEventListener('click', () => {
-        regenerateAssistantAt(messageIndex);
+        regenerateAssistantAt(entry.messageIndex);
       });
 
       const copyBtn = document.createElement('button');
@@ -1027,7 +1091,7 @@
       copyBtn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><rect x="9" y="9" width="10" height="10" rx="3" stroke="currentColor" stroke-width="1.7"/><path d="M15 9V8a3 3 0 0 0-3-3H8a3 3 0 0 0-3 3v4a3 3 0 0 0 3 3h1" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>';
       copyBtn.addEventListener('click', async () => {
         try {
-          await copyToClipboard(typeof initialText === 'string' ? initialText : extractTextContent(initialText));
+          await copyToClipboard(typeof entry.text === 'string' ? entry.text : extractTextContent(entry.text));
           toast(text('webui.chat.copySuccess', 'Copied'), 'info');
         } catch (error) {
           toast(error.message || String(error), 'error');
@@ -1041,7 +1105,7 @@
       likeBtn.setAttribute('title', text('webui.chat.like', 'Like'));
       likeBtn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M7 11.5v7.5M10.5 19h6.1a1.8 1.8 0 0 0 1.76-1.44l1.12-5.6A1.8 1.8 0 0 0 17.72 10H14V6.9a1.7 1.7 0 0 0-3.12-.93L7 11.5v7.5" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>';
       likeBtn.addEventListener('click', () => {
-        setAssistantFeedback(messageIndex, 'up');
+        setAssistantFeedback(entry.messageIndex, 'up');
       });
 
       const dislikeBtn = document.createElement('button');
@@ -1051,7 +1115,7 @@
       dislikeBtn.setAttribute('title', text('webui.chat.dislike', 'Dislike'));
       dislikeBtn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M7 12.5V5M10.5 5h6.1a1.8 1.8 0 0 1 1.76 1.44l1.12 5.6A1.8 1.8 0 0 1 17.72 14H14v3.1a1.7 1.7 0 0 1-3.12.93L7 12.5V5" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>';
       dislikeBtn.addEventListener('click', () => {
-        setAssistantFeedback(messageIndex, 'down');
+        setAssistantFeedback(entry.messageIndex, 'down');
       });
 
       right.appendChild(regenBtn);
@@ -1060,37 +1124,79 @@
       right.appendChild(dislikeBtn);
       actions.appendChild(right);
       wrap.appendChild(actions);
+      entry.actions = actions;
+      entry.likeBtn = likeBtn;
+      entry.dislikeBtn = dislikeBtn;
     }
 
     thread.appendChild(wrap);
 
-    return {
-      reasoning,
-      reasoningBody,
-      card,
-      text: initialText,
-      reasoningText: initialReasoning,
-      waiting: isAssistantWaiting,
-    };
+    syncAssistantActions(entry);
+    return entry;
+  }
+
+  function syncAssistantActions(entry) {
+    if (!entry || !entry.actions) return;
+    entry.actions.hidden = entry.messageIndex < 0;
+    const message = entry.messageIndex >= 0 ? messages[entry.messageIndex] : null;
+    if (entry.likeBtn) entry.likeBtn.classList.toggle('active', Boolean(message && message.feedback === 'up'));
+    if (entry.dislikeBtn) entry.dislikeBtn.classList.toggle('active', Boolean(message && message.feedback === 'down'));
+  }
+
+  function renderAssistantEntry(entry) {
+    if (!entry) return;
+    entry.renderFrame = 0;
+    if (entry.waiting) return;
+    if (hasMessageContent(entry.text)) {
+      renderMessageContent(entry.card, 'assistant', entry.text);
+    } else {
+      entry.card.innerHTML = '';
+    }
+    const hasReasoning = hasVisibleReasoning(entry.reasoningText);
+    entry.reasoning.hidden = !hasReasoning;
+    entry.reasoningBody.textContent = hasReasoning ? entry.reasoningText : '';
+  }
+
+  function scheduleAssistantEntryRender(entry) {
+    if (!entry) return;
+    if (!entry.renderFrame) {
+      entry.renderFrame = window.requestAnimationFrame(() => {
+        renderAssistantEntry(entry);
+        scrollThread();
+      });
+    } else {
+      scrollThread();
+    }
+  }
+
+  function flushAssistantEntry(entry) {
+    if (!entry) return;
+    if (entry.renderFrame) {
+      window.cancelAnimationFrame(entry.renderFrame);
+      entry.renderFrame = 0;
+    }
+    renderAssistantEntry(entry);
+  }
+
+  function finalizeAssistantEntry(entry, messageIndex) {
+    if (!entry) return;
+    entry.waiting = false;
+    flushAssistantEntry(entry);
+    entry.messageIndex = messageIndex;
+    syncAssistantActions(entry);
+    scrollThread();
   }
 
   function updateAssistant(entry, delta) {
     if (entry.waiting) entry.waiting = false;
     entry.text += delta;
-    renderMessageContent(entry.card, 'assistant', entry.text);
-    scrollThread();
+    scheduleAssistantEntryRender(entry);
   }
 
   function updateReasoning(entry, delta) {
-    if (entry.waiting) {
-      entry.waiting = false;
-      entry.card.innerHTML = '';
-    }
+    if (entry.waiting) entry.waiting = false;
     entry.reasoningText += delta;
-    const hasReasoning = hasVisibleReasoning(entry.reasoningText);
-    entry.reasoning.hidden = !hasReasoning;
-    entry.reasoningBody.textContent = hasReasoning ? entry.reasoningText : '';
-    scrollThread();
+    scheduleAssistantEntryRender(entry);
   }
 
   function renderThread() {
@@ -1114,8 +1220,11 @@
 
   function renderSessionList() {
     if (!sessionList) return;
-    sessionList.innerHTML = '';
     sessionList.dataset.empty = text('webui.chat.noSessions', 'No chats yet');
+    const nextSignature = `${currentSessionId}|${sessions.map((session) => `${session.id}:${session.title || ''}`).join('|')}`;
+    if (nextSignature === sessionListRenderSignature) return;
+    sessionListRenderSignature = nextSignature;
+    const fragment = document.createDocumentFragment();
 
     sessions.forEach((session) => {
       const item = document.createElement('button');
@@ -1154,8 +1263,9 @@
       item.appendChild(title);
       item.appendChild(actions);
       item.addEventListener('click', () => switchSession(session.id));
-      sessionList.appendChild(item);
+      fragment.appendChild(item);
     });
+    sessionList.replaceChildren(fragment);
   }
 
   function syncCurrentSession() {
@@ -1369,7 +1479,7 @@
             feedback: '',
           });
           syncCurrentSession();
-          renderThread();
+          finalizeAssistantEntry(assistantEntry, messages.length - 1);
           setStatus(text('webui.chat.statusDone', 'Completed'));
           return true;
         }
@@ -1427,7 +1537,7 @@
         feedback: '',
       });
       syncCurrentSession();
-      renderThread();
+      finalizeAssistantEntry(assistantEntry, messages.length - 1);
       setStatus(text('webui.chat.statusDone', 'Completed'));
     } catch (error) {
       if (error && error.name === 'AbortError') {

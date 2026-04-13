@@ -341,6 +341,34 @@ const SCHEMA_DEF = [
           { key: 'webui_key', label: 'WebUI 访问密码', labelKey: 'config.schema.fields.webuiKey.label', type: 'password', desc: 'WebUI 的访问鉴权密码。配置后访问时必须提供。', descKey: 'config.schema.fields.webuiKey.desc', rand: true, showIf: 'app.webui_enabled' },
         ]
       },
+      {
+        title: '日志配置', titleKey: 'config.schema.groups.logging',
+        section: 'logging',
+        fields: [
+          {
+            key: 'file_level',
+            label: '文件日志等级',
+            labelKey: 'config.schema.fields.fileLogLevel.label',
+            type: 'select',
+            options: [
+              { value: 'DEBUG', label: 'DEBUG' },
+              { value: 'INFO', label: 'INFO' },
+              { value: 'WARNING', label: 'WARNING' },
+              { value: 'ERROR', label: 'ERROR' },
+            ],
+            desc: '日志文件写入的最低等级，可独立于控制台配置。默认 INFO。',
+            descKey: 'config.schema.fields.fileLogLevel.desc',
+          },
+          {
+            key: 'max_files',
+            label: '日志保留天数',
+            labelKey: 'config.schema.fields.logMaxFiles.label',
+            type: 'number',
+            desc: '按天轮转时最多保留的日志文件数量。默认 7。',
+            descKey: 'config.schema.fields.logMaxFiles.desc',
+          },
+        ]
+      },
     ]
   },
   {
@@ -604,14 +632,78 @@ let _cfg = {};        // loaded config (nested)
 let _dirty = {};      // { "section.key": newValue }
 let _activeTab = SCHEMA_DEF[0].id;
 let _configLoaded = false;
+let _rowRefs = new Map();
+let _tabButtons = new Map();
+let _tabDirtyCounts = new Map();
+let _tabFieldIndex = new Map();
+let _conditionalRows = [];
+let _selectRefs = [];
+let _showIfDeps = new Map();
+let _disabledSelectDeps = new Map();
 
 function tr(key, params, fallback) {
+  if (!key) return fallback ?? '';
   const value = t(key, params);
   return value === key ? (fallback ?? key) : value;
 }
 
 function waitI18n() {
   return new Promise((resolve) => I18n.onReady(resolve));
+}
+
+function _addDependency(depMap, path, target) {
+  if (!path || !target) return;
+  if (!depMap.has(path)) depMap.set(path, []);
+  depMap.get(path).push(target);
+}
+
+function _showIfPaths(showIf) {
+  if (!showIf) return [];
+  return [typeof showIf === 'string' ? showIf : showIf.path].filter(Boolean);
+}
+
+function _disabledWhenPaths(condition) {
+  if (condition === 'no_app_url') return ['app.app_url'];
+  return [];
+}
+
+function _collectDependentTargets(paths, depMap) {
+  if (!Array.isArray(paths) || !paths.length) return [];
+  const seen = new Set();
+  const items = [];
+  paths.forEach((path) => {
+    (depMap.get(path) || []).forEach((target) => {
+      if (seen.has(target)) return;
+      seen.add(target);
+      items.push(target);
+    });
+  });
+  return items;
+}
+
+function _syncTabDirtyState(tabId) {
+  const btn = _tabButtons.get(tabId);
+  if (!btn) return;
+  btn.classList.toggle('dirty', (_tabDirtyCounts.get(tabId) || 0) > 0);
+}
+
+function _updateDirtyCount(fp, delta) {
+  const tabId = _tabFieldIndex.get(fp);
+  if (!tabId || !delta) return;
+  const next = Math.max(0, (_tabDirtyCounts.get(tabId) || 0) + delta);
+  _tabDirtyCounts.set(tabId, next);
+  _syncTabDirtyState(tabId);
+}
+
+function _resetRenderCaches() {
+  _rowRefs = new Map();
+  _tabButtons = new Map();
+  _tabDirtyCounts = new Map();
+  _tabFieldIndex = new Map();
+  _conditionalRows = [];
+  _selectRefs = [];
+  _showIfDeps = new Map();
+  _disabledSelectDeps = new Map();
 }
 
 function _localizeOption(opt) {
@@ -734,11 +826,14 @@ function renderInput(field, section, value) {
   const fp = _fullPath(section, field.key);
 
   const onChange = (v) => {
+    const wasDirty = fp in _dirty;
     const orig = _getValue(section, field.key);
     const same = String(orig) === String(v) || orig === v;
     if (same) delete _dirty[fp]; else _dirty[fp] = v;
+    const isDirty = fp in _dirty;
+    if (wasDirty !== isDirty) _updateDirtyCount(fp, isDirty ? 1 : -1);
     _refreshRow(section, field.key);
-    _refreshDirtyState();
+    _refreshDirtyState({ changedPaths: [fp] });
   };
 
   if (field.type === 'bool') {
@@ -754,6 +849,7 @@ function renderInput(field, section, value) {
 
   if (field.type === 'select') {
     const sel = _el('select', { class: 'cfg-select', id: `field-${section}-${field.key}` });
+    const deps = new Set();
     (field.options || []).forEach(opt => {
       const o = document.createElement('option');
       o.value = (typeof opt === 'object') ? opt.value : opt;
@@ -765,9 +861,14 @@ function renderInput(field, section, value) {
         const isDisabled = _evalDisabledWhen(opt.disabledWhen);
         o.disabled = isDisabled;
         if (isDisabled && opt.disabledTip) o.title = opt.disabledTip;
+        _disabledWhenPaths(opt.disabledWhen).forEach((path) => deps.add(path));
       }
       sel.appendChild(o);
     });
+    if (deps.size) {
+      _selectRefs.push(sel);
+      deps.forEach((path) => _addDependency(_disabledSelectDeps, path, sel));
+    }
     sel.addEventListener('change', () => onChange(sel.value));
     return sel;
   }
@@ -815,7 +916,7 @@ function renderInput(field, section, value) {
   return inp;
 }
 
-function renderRow(field, section) {
+function renderRow(field, section, tabId) {
   const fp      = _fullPath(section, field.key);
   const value   = _getValue(section, field.key);
   const isDirty = fp in _dirty;
@@ -852,18 +953,24 @@ function renderRow(field, section) {
     'data-key': field.key,
   }, labelCol, inputCol);
 
+  _rowRefs.set(fp, row);
+  _tabFieldIndex.set(fp, tabId);
+  if (isDirty) _tabDirtyCounts.set(tabId, (_tabDirtyCounts.get(tabId) || 0) + 1);
+
   // Conditional visibility
   if (field.showIf) {
-    row.dataset.showIf = JSON.stringify(field.showIf);
+    row._showIfSpec = field.showIf;
     row.style.display = _evalShowIf(field.showIf) ? '' : 'none';
+    _conditionalRows.push(row);
+    _showIfPaths(field.showIf).forEach((path) => _addDependency(_showIfDeps, path, row));
   }
 
   return row;
 }
 
-function renderGroup(group) {
+function renderGroup(group, tabId) {
   const section = group.section;
-  const rows    = group.fields.map(f => renderRow(f, f.section || section));
+  const rows    = group.fields.map(f => renderRow(f, f.section || section, tabId));
   const titleEl = _el('div', { class: 'cfg-group-title' }, group.title || '');
   const wrap    = _el('div', { class: 'cfg-group' }, titleEl, ...rows);
   return wrap;
@@ -872,13 +979,14 @@ function renderGroup(group) {
 function renderPanel(tab) {
   const panel = _el('div', { class: `cfg-panel${tab.id === _activeTab ? ' active' : ''}`,
     id: `panel-${tab.id}` });
-  tab.groups.forEach(g => panel.appendChild(renderGroup(g)));
+  tab.groups.forEach(g => panel.appendChild(renderGroup(g, tab.id)));
   return panel;
 }
 
 function renderAll() {
   const nav    = document.getElementById('cfg-nav');
   const panels = document.getElementById('cfg-panels');
+  _resetRenderCaches();
   nav.innerHTML = ''; panels.innerHTML = '';
 
   SCHEMA.forEach(tab => {
@@ -888,11 +996,13 @@ function renderAll() {
       onclick: () => switchTab(tab.id),
       'data-tab': tab.id,
     }, tab.label, _el('span', { class: 'dot' }));
+    _tabButtons.set(tab.id, btn);
     nav.appendChild(btn);
 
     // Panel
     panels.appendChild(renderPanel(tab));
   });
+  _tabButtons.forEach((_, tabId) => _syncTabDirtyState(tabId));
 }
 
 function switchTab(id) {
@@ -905,11 +1015,39 @@ function switchTab(id) {
 
 // ── Dirty state helpers ────────────────────────────────────────────────────
 function _refreshRow(section, key) {
-  const row = document.querySelector(`.cfg-row[data-section="${section}"][data-key="${key}"]`);
+  const row = _rowRefs.get(_fullPath(section, key));
   if (row) row.classList.toggle('modified', _fullPath(section, key) in _dirty);
 }
 
-function _refreshDirtyState({ autoNormalizeSelects = true } = {}) {
+function _refreshConditionalRows(changedPaths = null) {
+  const rows = changedPaths ? _collectDependentTargets(changedPaths, _showIfDeps) : _conditionalRows;
+  rows.forEach((row) => {
+    row.style.display = _evalShowIf(row._showIfSpec) ? '' : 'none';
+  });
+}
+
+function _refreshSelectStates(changedPaths = null, { autoNormalizeSelects = true } = {}) {
+  const selects = changedPaths ? _collectDependentTargets(changedPaths, _disabledSelectDeps) : _selectRefs;
+  selects.forEach((sel) => {
+    let anyChanged = false;
+    [...sel.options].forEach(o => {
+      if (!o.dataset.disabledWhen) return;
+      const isDisabled = _evalDisabledWhen(o.dataset.disabledWhen);
+      o.disabled = isDisabled;
+      o.title = isDisabled ? (o.dataset.disabledTip || '') : '';
+      if (autoNormalizeSelects && isDisabled && o.selected) anyChanged = true;
+    });
+    if (anyChanged) {
+      const firstEnabled = [...sel.options].find(o => !o.disabled);
+      if (firstEnabled) {
+        firstEnabled.selected = true;
+        sel.dispatchEvent(new Event('change'));
+      }
+    }
+  });
+}
+
+function _refreshDirtyState({ autoNormalizeSelects = true, changedPaths = null } = {}) {
   const n = Object.keys(_dirty).length;
   document.getElementById('btn-save').disabled  = n === 0;
   document.getElementById('btn-reset').disabled = n === 0;
@@ -930,39 +1068,9 @@ function _refreshDirtyState({ autoNormalizeSelects = true } = {}) {
     webuiLinkBtn.setAttribute('aria-label', webuiLinkBtn.title);
   }
 
-  // Update showIf conditional rows
-  document.querySelectorAll('.cfg-row[data-show-if]').forEach(row => {
-    const spec = JSON.parse(row.dataset.showIf);
-    row.style.display = _evalShowIf(spec) ? '' : 'none';
-  });
-
-  // Re-evaluate disabled options in selects
-  document.querySelectorAll('select.cfg-select').forEach(sel => {
-    let anyChanged = false;
-    [...sel.options].forEach(o => {
-      if (!o.dataset.disabledWhen) return;
-      const isDisabled = _evalDisabledWhen(o.dataset.disabledWhen);
-      o.disabled = isDisabled;
-      o.title = isDisabled ? (o.dataset.disabledTip || '') : '';
-      if (autoNormalizeSelects && isDisabled && o.selected) anyChanged = true;
-    });
-    // If the currently selected option became disabled, switch to first enabled
-    if (anyChanged) {
-      const firstEnabled = [...sel.options].find(o => !o.disabled);
-      if (firstEnabled) {
-        firstEnabled.selected = true;
-        sel.dispatchEvent(new Event('change'));
-      }
-    }
-  });
-
-  // Tab dirty dots — check if any dirty key belongs to a row in that panel
-  SCHEMA.forEach(tab => {
-    const panel = document.getElementById(`panel-${tab.id}`);
-    const relevant = panel ? [...panel.querySelectorAll('.cfg-row')].some(r =>
-      _fullPath(r.dataset.section, r.dataset.key) in _dirty) : false;
-    document.querySelector(`.cfg-tab[data-tab="${tab.id}"]`)?.classList.toggle('dirty', relevant);
-  });
+  _refreshConditionalRows(changedPaths);
+  _refreshSelectStates(changedPaths, { autoNormalizeSelects });
+  if (!changedPaths) _tabButtons.forEach((_, tabId) => _syncTabDirtyState(tabId));
 }
 
 // ── Load config ────────────────────────────────────────────────────────────

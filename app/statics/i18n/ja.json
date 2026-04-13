@@ -334,7 +334,8 @@
         "clearance": "Cloudflare Clearance",
         "retry": "再試行ポリシー",
         "timeouts": "リクエストタイムアウト",
-        "imageProtocol": "NSFW と画像ストリーミング"
+        "imageProtocol": "NSFW と画像ストリーミング",
+        "logging": "ログ設定"
       },
       "options": {
         "imageFormat": {
@@ -413,7 +414,9 @@
         "assetListTimeout": { "label": "Asset 一覧タイムアウト（秒）" },
         "assetDeleteTimeout": { "label": "Asset 削除タイムアウト（秒）" },
         "streamTimeout": { "label": "ストリーミング待機タイムアウト（秒）" },
-        "interRoundWait": { "label": "ラウンド間待機時間（秒）" }
+        "interRoundWait": { "label": "ラウンド間待機時間（秒）" },
+        "fileLogLevel": { "label": "ファイルログレベル", "desc": "ログファイルに書き込む最低レベル。コンソールとは独立して設定できます。デフォルト: INFO。" },
+        "logMaxFiles": { "label": "ログ保持日数", "desc": "日次ローテーション時に保持するログファイルの最大数。デフォルト: 7。" }
       }
     }
   },

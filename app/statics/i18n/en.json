@@ -334,7 +334,8 @@
         "clearance": "Cloudflare Clearance",
         "retry": "Retry Policy",
         "timeouts": "Request Timeouts",
-        "imageProtocol": "NSFW and Image Streaming"
+        "imageProtocol": "NSFW and Image Streaming",
+        "logging": "Logging"
       },
       "options": {
         "imageFormat": {
@@ -569,6 +570,14 @@
         "interRoundWait": {
           "label": "Inter-Round Wait (s)",
           "desc": "Wait time used after each image round to determine whether the server keeps the connection open. If CLOSE is not received in time, the existing connection is reused for the next round."
+        },
+        "fileLogLevel": {
+          "label": "File Log Level",
+          "desc": "Minimum log level written to log files. Can be configured independently from the console. Default: INFO."
+        },
+        "logMaxFiles": {
+          "label": "Log Retention (days)",
+          "desc": "Maximum number of daily log files to keep during rotation. Default: 7."
         }
       }
     }

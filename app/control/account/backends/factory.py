@@ -132,7 +132,7 @@ def _make_sql(dialect: str) -> AccountRepository:
     else:
         url    = _get_env("ACCOUNT_POSTGRESQL_URL")
         engine = create_pgsql_engine(url)
-    return SqlAccountRepository(engine, dialect=dialect)
+    return SqlAccountRepository(engine, dialect=dialect, dispose_engine=False)
 
 
 __all__ = ["create_repository", "describe_repository_target", "get_repository_backend"]

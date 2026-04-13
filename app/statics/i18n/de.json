@@ -334,7 +334,8 @@
         "clearance": "Cloudflare Clearance",
         "retry": "Wiederholungsrichtlinie",
         "timeouts": "Zeitlimits",
-        "imageProtocol": "NSFW und Bild-Streaming"
+        "imageProtocol": "NSFW und Bild-Streaming",
+        "logging": "Protokollierung"
       },
       "options": {
         "imageFormat": {
@@ -413,7 +414,9 @@
         "assetListTimeout": { "label": "Asset-Listen-Timeout (s)" },
         "assetDeleteTimeout": { "label": "Asset-Lösch-Timeout (s)" },
         "streamTimeout": { "label": "Streaming-Leerlauf-Timeout (s)" },
-        "interRoundWait": { "label": "Wartezeit zwischen Runden (s)" }
+        "interRoundWait": { "label": "Wartezeit zwischen Runden (s)" },
+        "fileLogLevel": { "label": "Datei-Protokollebene", "desc": "Mindeststufe für Protokolldateien, unabhängig von der Konsole konfigurierbar. Standard: INFO." },
+        "logMaxFiles": { "label": "Protokoll-Aufbewahrung (Tage)", "desc": "Maximale Anzahl täglicher Protokolldateien bei der Rotation. Standard: 7." }
       }
     }
   },

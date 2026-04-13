@@ -33,6 +33,8 @@ class ProxyClearanceScheduler:
         logger.info("proxy clearance scheduler stopped")
 
     async def _loop(self) -> None:
+        # Warm up immediately on start so the first request doesn't block.
+        await self._warm_up()
         while self._running:
             try:
                 interval = self._get_interval()
@@ -50,10 +52,22 @@ class ProxyClearanceScheduler:
                 )
                 await asyncio.sleep(60)
 
-    async def _refresh(self) -> None:
-        """Reload proxy configuration (which triggers bundle refresh)."""
+    async def _warm_up(self) -> None:
+        """Pre-fetch clearance bundles without invalidating existing ones."""
         try:
-            await self._directory.load()
+            await self._directory.warm_up()
+            logger.debug("proxy clearance warm-up completed")
+        except Exception as exc:
+            logger.warning("proxy clearance warm-up failed: error={}", exc)
+
+    async def _refresh(self) -> None:
+        """Build fresh clearance bundles and swap atomically (build-then-swap).
+
+        Old bundles are kept if FlareSolverr is unavailable, so a transient
+        refresh failure never leaves requests without clearance.
+        """
+        try:
+            await self._directory.refresh_clearance_safe()
             logger.debug("proxy clearance refresh completed")
         except Exception as exc:
             logger.warning("proxy clearance refresh failed: error={}", exc)

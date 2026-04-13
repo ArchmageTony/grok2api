@@ -31,20 +31,22 @@ async def mark_account_invalid_credentials(
     ts = now_ms()
     ext = record.ext if record is not None else {}
 
-    await repo.patch_accounts([
-        AccountPatch(
-            token=token,
-            status=AccountStatus.EXPIRED,
-            last_fail_at=ts,
-            last_fail_reason=reason,
-            state_reason=reason,
-            ext_merge={
-                **ext,
-                "expired_at": ts,
-                "expired_reason": reason,
-            },
-        )
-    ])
+    await repo.patch_accounts(
+        [
+            AccountPatch(
+                token=token,
+                status=AccountStatus.EXPIRED,
+                last_fail_at=ts,
+                last_fail_reason=reason,
+                state_reason=reason,
+                ext_merge={
+                    **ext,
+                    "expired_at": ts,
+                    "expired_reason": reason,
+                },
+            )
+        ]
+    )
     logger.info(
         "account expired from {}: token={}... status={} upstream_status={}",
         source,
@@ -59,6 +61,14 @@ def feedback_kind_for_error(exc: BaseException | None) -> FeedbackKind:
     """Map an upstream exception to the appropriate account feedback kind."""
     if exc is None:
         return FeedbackKind.SERVER_ERROR
+    # Check for known blocked/invalid body markers first — these override
+    # the generic status-code mapping so that e.g. a 403 with "blocked-user"
+    # body is treated as an account-level credential failure, not a generic
+    # FORBIDDEN that only lowers health.
+    from app.dataplane.reverse.protocol.xai_usage import is_invalid_credentials_error
+
+    if is_invalid_credentials_error(exc):
+        return FeedbackKind.UNAUTHORIZED
     status = getattr(exc, "status", 0)
     if status == 429:
         return FeedbackKind.RATE_LIMITED
@@ -66,9 +76,6 @@ def feedback_kind_for_error(exc: BaseException | None) -> FeedbackKind:
         return FeedbackKind.UNAUTHORIZED
     if status == 403:
         return FeedbackKind.FORBIDDEN
-    from app.dataplane.reverse.protocol.xai_usage import is_invalid_credentials_error
-    if is_invalid_credentials_error(exc):
-        return FeedbackKind.UNAUTHORIZED
     return FeedbackKind.SERVER_ERROR
 
 

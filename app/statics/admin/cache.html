@@ -433,6 +433,12 @@ const _assetSel = new Set();
 let _assetTaskId = null;
 let _assetEs = null;
 let _assetLoaded = false;
+let _localViewVersion = 0;
+let _localViewCacheVersion = -1;
+let _localViewCache = null;
+let _assetViewVersion = 0;
+let _assetViewCacheVersion = -1;
+let _assetViewCache = null;
 
 function tr(key, params, fallback) {
   const value = t(key, params);
@@ -454,6 +460,89 @@ function getTypeNoun(type = _type) {
 function loadSavedPageSize() {
   const raw = Number(localStorage.getItem(PAGE_SIZE_KEY));
   return PAGE_SIZE_OPTIONS.includes(raw) ? raw : 100;
+}
+
+function invalidateLocalView() {
+  _localViewVersion += 1;
+}
+
+function invalidateAssetView() {
+  _assetViewVersion += 1;
+}
+
+function getLocalView() {
+  if (_localViewCache && _localViewCacheVersion === _localViewVersion) return _localViewCache;
+
+  const selectedNames = [];
+  for (const item of _localItems) {
+    if (_localSel.has(item.name)) selectedNames.push(item.name);
+  }
+  const selectedCount = selectedNames.length;
+
+  _localViewCacheVersion = _localViewVersion;
+  _localViewCache = {
+    items: _localItems,
+    selectedNames,
+    totalItems: _localItems.length,
+    selectedCount,
+    hasSelection: selectedCount > 0,
+    allSelected: _localItems.length > 0 && selectedCount === _localItems.length,
+    someSelected: selectedCount > 0 && selectedCount < _localItems.length,
+  };
+  return _localViewCache;
+}
+
+function getAssetView() {
+  if (_assetViewCache && _assetViewCacheVersion === _assetViewVersion) return _assetViewCache;
+
+  const rows = [];
+  const clearableTokens = [];
+  const selectedClearableTokens = [];
+  let countedAssets = 0;
+  let selectedCount = 0;
+
+  for (const row of _assetData) {
+    const masked = row.masked || _maskToken(row.token || '');
+    const count = row.count || 0;
+    const hasItems = count > 0;
+    const isSelected = _assetSel.has(row.token);
+    const assets = Array.isArray(row.assets) ? row.assets : [];
+
+    countedAssets += count;
+    if (isSelected) selectedCount += 1;
+    if (hasItems) clearableTokens.push(row.token);
+    if (isSelected && hasItems) selectedClearableTokens.push(row.token);
+
+    rows.push({
+      row,
+      masked,
+      assets,
+      hasItems,
+      isOpen: !!_expanded[masked],
+      isSelected,
+    });
+  }
+
+  const totalRows = rows.length;
+  const selectedClearableCount = selectedClearableTokens.length;
+
+  _assetViewCacheVersion = _assetViewVersion;
+  _assetViewCache = {
+    loaded: _assetLoaded,
+    rows,
+    totalRows,
+    totalAccounts: totalRows,
+    totalAssets: _assetTotal || countedAssets,
+    selectedCount,
+    hasSelection: selectedCount > 0,
+    allSelected: totalRows > 0 && selectedCount === totalRows,
+    someSelected: selectedCount > 0 && selectedCount < totalRows,
+    clearableTokens,
+    hasClearable: clearableTokens.length > 0,
+    selectedClearableTokens,
+    selectedClearableCount,
+  };
+  return _assetViewCache;
 }
 
 function setLoadAssetsButton(labelKey, fallback, spinning = false) {
@@ -485,19 +574,18 @@ function applyToolbarI18n() {
   });
 }
 
-function updateAssetSummary() {
-  if (!_assetLoaded) {
+function updateAssetSummary(view = getAssetView()) {
+  if (!view.loaded) {
     document.getElementById('asset-summary').textContent = tr('cache.assetSummaryIdle', null, '点击右侧获取在线资产');
-    document.getElementById('btn-clear-all-assets').style.display = 'none';
+    updateAssetBatchButtons(view);
     return;
   }
-  const totalAssets = _assetTotal || _assetData.reduce((sum, row) => sum + (row.count || 0), 0);
   document.getElementById('asset-summary').textContent = tr(
     'cache.assetSummary',
-    { accounts: _assetData.length, files: totalAssets },
-    `共 ${_assetData.length} 个账户 · ${totalAssets} 个文件`
+    { accounts: view.totalAccounts, files: view.totalAssets },
+    `共 ${view.totalAccounts} 个账户 · ${view.totalAssets} 个文件`
   );
-  document.getElementById('btn-clear-all-assets').style.display = _assetData.some((row) => row.count > 0) ? '' : 'none';
+  updateAssetBatchButtons(view);
 }
 
 function applyCacheI18n() {
@@ -510,10 +598,10 @@ function applyCacheI18n() {
   applyToolbarI18n();
   setLoadAssetsButton('cache.loadAssets', '加载资产列表');
   _renderPagi();
-  if (_assetData.length) {
+  if (_assetLoaded) {
     _renderAssets();
-    updateAssetSummary();
   }
+  updateAssetSummary();
 }
 
 async function _api(method, path, body) {
@@ -549,8 +637,9 @@ async function loadList() {
     const d = await _api('GET', `/cache/list?type=${_type}&page=${_page}&page_size=${_pageSize}`);
     _total = d.total ?? 0;
     _localItems = d.items || [];
+    invalidateLocalView();
     _reconcileLocalSelection();
-    _renderTable(_localItems);
+    _renderTable();
     _renderPagi();
     updateLocalBatchButtons();
   } catch (e) {
@@ -558,9 +647,10 @@ async function loadList() {
   }
 }
 
-function _renderTable(items) {
+function _renderTable(view = getLocalView()) {
   const tbody = document.getElementById('cache-tbody');
-  syncLocalSelectAll();
+  const items = view.items;
+  syncLocalSelectAll(view);
   if (!items.length) {
     tbody.innerHTML = `<tr><td colspan="5" class="table-empty">${_esc(tr('cache.emptyLocal', null, '暂无缓存文件'))}</td></tr>`;
     return;
@@ -583,7 +673,7 @@ function _renderTable(items) {
       <td>${_fmtTime(f.modified_at)}</td>
       <td><div class="row-actions"><button class="row-action" onclick="viewFile('${_esc(f.name)}')" title="${_esc(tr('cache.actionView', null, '查看'))}" aria-label="${_esc(tr('cache.actionView', null, '查看'))}"><svg viewBox="0 0 24 24" stroke-width="1.8"><path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6-10-6-10-6Z"/><circle cx="12" cy="12" r="3"/></svg></button><button class="row-action row-action-danger" onclick="deleteFile('${_esc(f.name)}')" title="${_esc(tr('cache.actionDelete', null, '删除'))}" aria-label="${_esc(tr('cache.actionDelete', null, '删除'))}"><svg viewBox="0 0 24 24" stroke-width="1.8"><path d="M5 7h14"/><path d="M9 7V4h6v3"/><path d="M8 10v7"/><path d="M12 10v7"/><path d="M16 10v7"/><path d="M7 7l1 13h8l1-13"/></svg></button></div></td>
     </tr>`).join('');
-  syncLocalSelectAll();
+  syncLocalSelectAll(view);
 }
 
 function _renderPagi() {
@@ -689,6 +779,7 @@ async function loadAssets() {
     _assetData = d.tokens || [];
     _assetTotal = d.total_assets ?? _assetData.reduce((sum, row) => sum + (row.count || 0), 0);
     _expanded = {};
+    invalidateAssetView();
     _reconcileAssetSelection();
     _renderAssets();
     updateAssetSummary();
@@ -698,6 +789,7 @@ async function loadAssets() {
     _assetTotal = 0;
     _expanded = {};
     _assetSel.clear();
+    invalidateAssetView();
     _renderAssets();
     updateAssetSummary();
     showToast(tr('cache.loadFailed', { message: e.message }, `加载失败: ${e.message}`), 'error');
@@ -707,14 +799,14 @@ async function loadAssets() {
   }
 }
 
-function _renderAssets() {
+function _renderAssets(view = getAssetView()) {
   const tbody = document.getElementById('assets-tbody');
-  syncAssetSelectAll();
-  if (!_assetLoaded) {
+  syncAssetSelectAll(view);
+  if (!view.loaded) {
     tbody.innerHTML = `<tr><td colspan="5" class="table-empty">${_esc(tr('cache.emptyAssetsIdle', null, '点击右上角获取在线资产列表'))}</td></tr>`;
     return;
   }
-  if (!_assetData.length) {
+  if (!view.totalRows) {
     tbody.innerHTML = `<tr><td colspan="5" class="table-empty">${_esc(tr('cache.emptyAccounts', null, '暂无账户数据'))}</td></tr>`;
     return;
   }
@@ -726,14 +818,12 @@ function _renderAssets() {
   const naLabel = tr('cache.na', null, '—');
 
   const rows = [];
-  for (const row of _assetData) {
-    const isOpen = !!_expanded[row.masked];
-    const hasItems = row.count > 0;
+  for (const { row, masked, assets, hasItems, isOpen, isSelected } of view.rows) {
     rows.push(`
       <tr>
-        <td><input type="checkbox" class="cb asset-row-cb" data-token="${_esc(row.token)}" ${_assetSel.has(row.token) ? 'checked' : ''} onchange="toggleAssetRow(this)"></td>
+        <td><input type="checkbox" class="cb asset-row-cb" data-token="${_esc(row.token)}" ${isSelected ? 'checked' : ''} onchange="toggleAssetRow(this)"></td>
         <td style="padding:10px 8px 10px 14px">
-          ${hasItems ? `<button class="expand-btn${isOpen ? ' open' : ''}" onclick="toggleExpand('${_esc(row.masked)}')" title="${_esc(isOpen ? collapseLabel : expandLabel)}">
+          ${hasItems ? `<button class="expand-btn${isOpen ? ' open' : ''}" onclick="toggleExpand('${_esc(masked)}')" title="${_esc(isOpen ? collapseLabel : expandLabel)}">
             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="9 18 15 12 9 6"/></svg>
           </button>` : '<span style="width:22px;display:inline-block"></span>'}
         </td>
@@ -742,7 +832,7 @@ function _renderAssets() {
             <span class="row-icon" aria-hidden="true">
               <svg viewBox="0 0 24 24" fill="none" stroke-width="1.8"><path d="M7 10V8a5 5 0 0 1 10 0v2"/><rect x="4" y="10" width="16" height="10" rx="2"/><circle cx="12" cy="15" r="1"/></svg>
             </span>
-            <span class="row-value">${_esc(row.masked)}</span>
+            <span class="row-value">${_esc(masked)}</span>
           </div>
           ${row.error ? `<span class="asset-err" title="${_esc(row.error)}">⚠ ${_esc(row.error)}</span>` : ''}
         </td>
@@ -750,12 +840,12 @@ function _renderAssets() {
           <span class="asset-count-badge${hasItems ? ' has-items' : ''}">${row.count}</span>
         </td>
         <td>
-          ${hasItems ? `<div class="row-actions"><button class="row-action row-action-danger" onclick="clearTokenAssets('${_esc(row.token)}','${_esc(row.masked)}')" title="${_esc(clearLabel)}" aria-label="${_esc(clearLabel)}"><svg viewBox="0 0 24 24" stroke-width="1.8"><path d="M5 7h14"/><path d="M9 7V4h6v3"/><path d="M8 10v7"/><path d="M12 10v7"/><path d="M16 10v7"/><path d="M7 7l1 13h8l1-13"/></svg></button></div>` : ''}
+          ${hasItems ? `<div class="row-actions"><button class="row-action row-action-danger" onclick="clearTokenAssets('${_esc(row.token)}','${_esc(masked)}')" title="${_esc(clearLabel)}" aria-label="${_esc(clearLabel)}"><svg viewBox="0 0 24 24" stroke-width="1.8"><path d="M5 7h14"/><path d="M9 7V4h6v3"/><path d="M8 10v7"/><path d="M12 10v7"/><path d="M16 10v7"/><path d="M7 7l1 13h8l1-13"/></svg></button></div>` : ''}
         </td>
       </tr>`);
 
     if (isOpen && hasItems) {
-      for (const asset of row.assets) {
+      for (const asset of assets) {
         rows.push(`
           <tr class="sub-row">
             <td></td>
@@ -771,19 +861,20 @@ function _renderAssets() {
             </td>
             <td style="color:#aaa;font-size:11px">${asset.size ? _fmtBytes(asset.size) : _esc(naLabel)}</td>
             <td>
-              <div class="row-actions"><button class="row-action row-action-danger" onclick="deleteAssetItem('${_esc(row.token)}','${_esc(row.masked)}','${_esc(asset.id)}')" title="${_esc(deleteLabel)}" aria-label="${_esc(deleteLabel)}"><svg viewBox="0 0 24 24" stroke-width="1.8"><path d="M5 7h14"/><path d="M9 7V4h6v3"/><path d="M8 10v7"/><path d="M12 10v7"/><path d="M16 10v7"/><path d="M7 7l1 13h8l1-13"/></svg></button></div>
+              <div class="row-actions"><button class="row-action row-action-danger" onclick="deleteAssetItem('${_esc(row.token)}','${_esc(masked)}','${_esc(asset.id)}')" title="${_esc(deleteLabel)}" aria-label="${_esc(deleteLabel)}"><svg viewBox="0 0 24 24" stroke-width="1.8"><path d="M5 7h14"/><path d="M9 7V4h6v3"/><path d="M8 10v7"/><path d="M12 10v7"/><path d="M16 10v7"/><path d="M7 7l1 13h8l1-13"/></svg></button></div>
             </td>
           </tr>`);
       }
     }
   }
   tbody.innerHTML = rows.join('');
-  syncAssetSelectAll();
-  updateAssetBatchButtons();
+  syncAssetSelectAll(view);
+  updateAssetBatchButtons(view);
 }
 
 function toggleExpand(masked) {
   _expanded[masked] = !_expanded[masked];
+  invalidateAssetView();
   _renderAssets();
 }
 
@@ -808,6 +899,7 @@ async function deleteAssetItem(token, masked, assetId) {
       row.count = row.assets.length;
     }
     _assetTotal = _assetData.reduce((sum, item) => sum + (item.count || 0), 0);
+    invalidateAssetView();
     _renderAssets();
     updateAssetSummary();
   } catch (e) {
@@ -817,29 +909,35 @@ async function deleteAssetItem(token, masked, assetId) {
 
 function _reconcileLocalSelection() {
   const names = new Set(_localItems.map((item) => item.name));
+  let changed = false;
   [..._localSel].forEach((name) => {
-    if (!names.has(name)) _localSel.delete(name);
+    if (!names.has(name)) {
+      _localSel.delete(name);
+      changed = true;
+    }
   });
+  if (changed) invalidateLocalView();
 }
 
-function syncLocalSelectAll() {
+function syncLocalSelectAll(view = getLocalView()) {
   const cbAll = document.getElementById('cb-local-all');
   if (!cbAll) return;
-  if (!_localItems.length) {
+  if (!view.totalItems) {
     cbAll.checked = false;
     cbAll.indeterminate = false;
     return;
   }
-  const selected = _localItems.filter((item) => _localSel.has(item.name)).length;
-  cbAll.checked = selected === _localItems.length;
-  cbAll.indeterminate = selected > 0 && selected < _localItems.length;
+  cbAll.checked = view.allSelected;
+  cbAll.indeterminate = view.someSelected;
 }
 
 function toggleAllLocal(checked) {
-  _localItems.forEach((item) => {
+  const view = getLocalView();
+  view.items.forEach((item) => {
     if (checked) _localSel.add(item.name);
     else _localSel.delete(item.name);
   });
+  invalidateLocalView();
   document.querySelectorAll('.local-row-cb').forEach((el) => { el.checked = checked; });
   syncLocalSelectAll();
   updateLocalBatchButtons();
@@ -850,12 +948,14 @@ function toggleLocalRow(el) {
   if (!name) return;
   if (el.checked) _localSel.add(name);
   else _localSel.delete(name);
+  invalidateLocalView();
   syncLocalSelectAll();
   updateLocalBatchButtons();
 }
 
 function clearLocalSelection(render = true) {
   _localSel.clear();
+  invalidateLocalView();
   syncLocalSelectAll();
   updateLocalBatchButtons();
   if (render) {
@@ -863,8 +963,8 @@ function clearLocalSelection(render = true) {
   }
 }
 
-function updateLocalBatchButtons() {
-  const show = _localSel.size > 0;
+function updateLocalBatchButtons(view = getLocalView()) {
+  const show = view.hasSelection;
   const btnDelete = document.getElementById('btn-local-delete-selected');
   const btnClear = document.getElementById('btn-clear');
   if (btnDelete) btnDelete.style.display = show ? '' : 'none';
@@ -872,7 +972,7 @@ function updateLocalBatchButtons() {
 }
 
 async function deleteSelectedLocal() {
-  const names = _localItems.filter((item) => _localSel.has(item.name)).map((item) => item.name);
+  const names = getLocalView().selectedNames;
   if (!names.length) return;
   if (!confirm(tr('cache.deleteSelectedConfirm', { n: names.length }, `确定要删除选中的 ${names.length} 个文件吗？`))) return;
   try {
@@ -889,29 +989,35 @@ async function deleteSelectedLocal() {
 
 function _reconcileAssetSelection() {
   const tokens = new Set(_assetData.map((row) => row.token));
+  let changed = false;
   [..._assetSel].forEach((token) => {
-    if (!tokens.has(token)) _assetSel.delete(token);
+    if (!tokens.has(token)) {
+      _assetSel.delete(token);
+      changed = true;
+    }
   });
+  if (changed) invalidateAssetView();
 }
 
-function syncAssetSelectAll() {
+function syncAssetSelectAll(view = getAssetView()) {
   const cbAll = document.getElementById('cb-asset-all');
   if (!cbAll) return;
-  if (!_assetData.length) {
+  if (!view.totalRows) {
     cbAll.checked = false;
     cbAll.indeterminate = false;
     return;
   }
-  const selected = _assetData.filter((row) => _assetSel.has(row.token)).length;
-  cbAll.checked = selected === _assetData.length;
-  cbAll.indeterminate = selected > 0 && selected < _assetData.length;
+  cbAll.checked = view.allSelected;
+  cbAll.indeterminate = view.someSelected;
 }
 
 function toggleAllAssets(checked) {
-  _assetData.forEach((row) => {
+  const view = getAssetView();
+  view.rows.forEach(({ row }) => {
     if (checked) _assetSel.add(row.token);
     else _assetSel.delete(row.token);
   });
+  invalidateAssetView();
   document.querySelectorAll('.asset-row-cb').forEach((el) => { el.checked = checked; });
   syncAssetSelectAll();
   updateAssetBatchButtons();
@@ -922,12 +1028,14 @@ function toggleAssetRow(el) {
   if (!token) return;
   if (el.checked) _assetSel.add(token);
   else _assetSel.delete(token);
+  invalidateAssetView();
   syncAssetSelectAll();
   updateAssetBatchButtons();
 }
 
 function clearAssetSelection(render = true) {
   _assetSel.clear();
+  invalidateAssetView();
   syncAssetSelectAll();
   updateAssetBatchButtons();
   if (render) {
@@ -935,29 +1043,27 @@ function clearAssetSelection(render = true) {
   }
 }
 
-function updateAssetBatchButtons() {
-  const selected = _assetData.filter((row) => _assetSel.has(row.token) && row.count > 0).length;
+function updateAssetBatchButtons(view = getAssetView()) {
   const btnClearAll = document.getElementById('btn-clear-all-assets');
   const btnClearSelected = document.getElementById('btn-clear-selected-assets');
-  const showSelection = _assetSel.size > 0;
-  if (btnClearSelected) btnClearSelected.style.display = selected > 0 ? '' : 'none';
-  if (btnClearAll) btnClearAll.style.display = !showSelection && _assetData.some((row) => row.count > 0) ? '' : 'none';
+  if (btnClearSelected) btnClearSelected.style.display = view.selectedClearableCount > 0 ? '' : 'none';
+  if (btnClearAll) btnClearAll.style.display = !view.hasSelection && view.hasClearable ? '' : 'none';
 }
 
 async function clearSelectedAssets() {
-  const tokens = _assetData.filter((row) => _assetSel.has(row.token) && row.count > 0).map((row) => row.token);
+  const tokens = getAssetView().selectedClearableTokens;
   if (!tokens.length) return;
   await runAssetClear(tokens);
 }
 
 async function clearAllAssets() {
-  const tokens = _assetData.filter((row) => row.count > 0).map((row) => row.token);
+  const tokens = getAssetView().clearableTokens;
   if (!tokens.length) return;
   await runAssetClear(tokens);
 }
 
 async function runAssetClear(tokens) {
-  const allTokens = _assetData.filter((row) => row.count > 0).map((row) => row.token);
+  const allTokens = getAssetView().clearableTokens;
   const isAll = tokens.length === allTokens.length;
   if (isAll) {
     if (!confirm(tr('cache.clearAllConfirm', { n: tokens.length }, `确定要清理全部 ${tokens.length} 个账户的在线资产吗？此操作不可撤销。`))) return;

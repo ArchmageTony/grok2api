@@ -58,13 +58,19 @@ def _extract_bearer(authorization: str | None) -> str | None:
 
 async def verify_api_key(
     authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="x-api-key"),
 ) -> None:
-    """Validate Bearer token against configured ``api_key``."""
+    """Validate Bearer token against configured ``api_key``.
+
+    Accepts either ``Authorization: Bearer <key>`` (OpenAI / grok2api style)
+    or ``X-API-Key: <key>`` (official Anthropic SDK style) so that agents
+    targeting the Anthropic-compatible endpoint work without reconfiguration.
+    """
     allowed_keys = _get_keys()
     if not allowed_keys:
         return
 
-    token = _extract_bearer(authorization)
+    token = _extract_bearer(authorization) or x_api_key or None
     if token is None:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Missing or invalid Authorization header.")
 

@@ -334,7 +334,8 @@
         "clearance": "Cloudflare Clearance",
         "retry": "Politique de reprise",
         "timeouts": "Délais d’attente",
-        "imageProtocol": "NSFW et streaming d’images"
+        "imageProtocol": "NSFW et streaming d'images",
+        "logging": "Journalisation"
       },
       "options": {
         "imageFormat": {
@@ -413,7 +414,9 @@
         "assetListTimeout": { "label": "Délai de listage Asset (s)" },
         "assetDeleteTimeout": { "label": "Délai de suppression Asset (s)" },
         "streamTimeout": { "label": "Délai d’inactivité du streaming (s)" },
-        "interRoundWait": { "label": "Attente inter-cycle (s)" }
+        "interRoundWait": { "label": "Attente inter-cycle (s)" },
+        "fileLogLevel": { "label": "Niveau de journal fichier", "desc": "Niveau minimum écrit dans les fichiers de journal, configurable indépendamment de la console. Par défaut : INFO." },
+        "logMaxFiles": { "label": "Rétention des journaux (jours)", "desc": "Nombre maximum de fichiers de journal quotidiens conservés lors de la rotation. Par défaut : 7." }
       }
     }
   },

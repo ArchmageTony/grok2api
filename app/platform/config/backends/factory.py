@@ -73,7 +73,7 @@ def _make_sql(dialect: str) -> ConfigBackend:
             raise ValueError("PostgreSQL config backend requires ACCOUNT_POSTGRESQL_URL")
         engine = create_pgsql_engine(url)
 
-    return SqlConfigBackend(engine, dialect=dialect)
+    return SqlConfigBackend(engine, dialect=dialect, dispose_engine=False)
 
 
 __all__ = ["create_config_backend", "get_config_backend_name"]

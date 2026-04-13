@@ -334,7 +334,8 @@
         "clearance": "Cloudflare Clearance",
         "retry": "重试策略",
         "timeouts": "请求超时设置",
-        "imageProtocol": "NSFW 与图像协议"
+        "imageProtocol": "NSFW 与图像协议",
+        "logging": "日志配置"
       },
       "options": {
         "imageFormat": {
@@ -569,6 +570,14 @@
         "interRoundWait": {
           "label": "轮次间等待（秒）",
           "desc": "每轮出图完成后，用于探测服务端是否仍保持连接的等待时长；若超时未收到 CLOSE，则复用现有连接继续下一轮。"
+        },
+        "fileLogLevel": {
+          "label": "文件日志等级",
+          "desc": "日志文件写入的最低等级，可独立于控制台配置。默认 INFO。"
+        },
+        "logMaxFiles": {
+          "label": "日志保留天数",
+          "desc": "按天轮转时最多保留的日志文件数量。默认 7。"
         }
       }
     }

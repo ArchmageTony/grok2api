@@ -9,6 +9,7 @@ from app.platform.logging.logger import logger
 from app.platform.config.snapshot import get_config
 from app.platform.errors import UpstreamError
 from app.control.proxy.models import ProxyFeedback, ProxyFeedbackKind, ProxyScope, RequestKind
+from app.dataplane.reverse.transport._proxy_feedback import upstream_feedback
 from app.dataplane.proxy import get_proxy_runtime
 from app.dataplane.reverse.protocol.xai_video import (
     MEDIA_LINK_URL,
@@ -50,11 +51,7 @@ async def _post_with_proxy(
     except UpstreamError as exc:
         await proxy.feedback(
             lease,
-            ProxyFeedback(
-                kind        = ProxyFeedbackKind.UPSTREAM_5XX if (exc.status or 0) >= 500
-                              else ProxyFeedbackKind.FORBIDDEN,
-                status_code = exc.status or 502,
-            ),
+            upstream_feedback(exc),
         )
         raise
     except Exception as exc:

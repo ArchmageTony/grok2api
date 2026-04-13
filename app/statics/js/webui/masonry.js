@@ -19,6 +19,7 @@
   let activeSocket = null;
   let sending = false;
   let streamState = null;
+  let pendingGridSyncFrame = 0;
 
   function aspectRatioCss(value) {
     const ratio = String(value || '').trim();
@@ -40,12 +41,22 @@
   function syncBatchGrid(grid) {
     if (!(grid instanceof HTMLElement)) return;
     const columns = computeGridColumns(grid.clientWidth);
+    if (grid.dataset.columns === String(columns)) return;
+    grid.dataset.columns = String(columns);
     grid.style.setProperty('--masonry-columns', String(columns));
   }
 
   function syncAllBatchGrids() {
     feed?.querySelectorAll('.webui-masonry-grid').forEach((grid) => {
       syncBatchGrid(grid);
+    });
+  }
+
+  function scheduleAllBatchGridsSync() {
+    if (pendingGridSyncFrame) return;
+    pendingGridSyncFrame = window.requestAnimationFrame(() => {
+      pendingGridSyncFrame = 0;
+      syncAllBatchGrids();
     });
   }
 
@@ -154,6 +165,37 @@
 
     const body = document.createElement('div');
     body.className = 'webui-masonry-tile-body';
+
+    const link = document.createElement('a');
+    link.className = 'webui-masonry-tile-link';
+    link.target = '_blank';
+    link.rel = 'noopener';
+    link.setAttribute('aria-label', text('webui.masonry.openImage', '打开图片'));
+    link.title = text('webui.masonry.openImage', '打开图片');
+
+    const img = document.createElement('img');
+    img.alt = `image ${index}`;
+    img.loading = 'lazy';
+    link.appendChild(img);
+
+    const label = document.createElement('div');
+    label.className = 'webui-masonry-tile-label';
+
+    const progressShell = document.createElement('div');
+    progressShell.className = 'webui-masonry-tile-progress';
+
+    const progressValue = document.createElement('div');
+    progressValue.className = 'webui-masonry-tile-progress-value';
+
+    const progressTrack = document.createElement('div');
+    progressTrack.className = 'webui-masonry-tile-progress-track';
+
+    const progressFill = document.createElement('div');
+    progressFill.className = 'webui-masonry-tile-progress-fill';
+    progressTrack.appendChild(progressFill);
+    progressShell.appendChild(progressValue);
+    progressShell.appendChild(progressTrack);
+
     tile.appendChild(badge);
     tile.appendChild(body);
 
@@ -165,6 +207,15 @@
       moderated: false,
       tile,
       body,
+      link,
+      img,
+      label,
+      progressShell,
+      progressValue,
+      progressFill,
+      renderedState: '',
+      renderedProgress: -1,
+      renderedUrl: '',
     };
   }
 
@@ -240,12 +291,14 @@
       completed: false,
       failed: false,
       finalized: false,
+      readyCount: 0,
+      filteredCount: 0,
     };
   }
 
   function updateBatchMeta(batch) {
-    const completed = batch.slots.filter((slot) => slot.url && !slot.moderated).length;
-    const filtered = batch.slots.filter((slot) => slot.moderated).length;
+    const completed = batch.readyCount;
+    const filtered = batch.filteredCount;
     batch.count.textContent = `${completed}/${IMAGE_COUNT}`;
 
     if (!batch.finalized) {
@@ -284,59 +337,53 @@
   }
 
   function renderSlot(slot) {
-    slot.tile.classList.remove('is-pending', 'is-ready', 'is-filtered');
-    slot.body.replaceChildren();
+    const nextState = slot.url ? 'ready' : (slot.moderated ? 'filtered' : 'pending');
+    slot.tile.classList.toggle('is-pending', nextState === 'pending');
+    slot.tile.classList.toggle('is-ready', nextState === 'ready');
+    slot.tile.classList.toggle('is-filtered', nextState === 'filtered');
 
-    if (slot.url) {
-      slot.tile.classList.add('is-ready');
-      const link = document.createElement('a');
-      link.className = 'webui-masonry-tile-link';
-      link.href = slot.url;
-      link.target = '_blank';
-      link.rel = 'noopener';
-      link.setAttribute('aria-label', text('webui.masonry.openImage', '打开图片'));
-      link.title = text('webui.masonry.openImage', '打开图片');
-
-      const img = document.createElement('img');
-      img.src = slot.url;
-      img.alt = `image ${slot.index}`;
-      img.loading = 'lazy';
-
-      link.appendChild(img);
-      slot.body.appendChild(link);
+    if (nextState === 'ready') {
+      if (slot.renderedUrl !== slot.url) {
+        slot.link.href = slot.url;
+        slot.img.src = slot.url;
+        slot.renderedUrl = slot.url;
+      }
+      if (slot.renderedState !== nextState) slot.body.replaceChildren(slot.link);
+      slot.renderedState = nextState;
       return;
     }
 
-    const label = document.createElement('div');
-    if (slot.moderated) {
-      label.className = 'webui-masonry-tile-label';
-      label.textContent = text('webui.masonry.batchFiltered', '已过滤');
-      slot.tile.classList.add('is-filtered');
-    } else {
-      const progress = Math.max(0, Math.min(99, slot.progress || 0));
-      const shell = document.createElement('div');
-      shell.className = 'webui-masonry-tile-progress';
-
-      const value = document.createElement('div');
-      value.className = 'webui-masonry-tile-progress-value';
-      value.textContent = `${progress}%`;
-
-      const track = document.createElement('div');
-      track.className = 'webui-masonry-tile-progress-track';
-
-      const fill = document.createElement('div');
-      fill.className = 'webui-masonry-tile-progress-fill';
-      fill.style.width = `${progress}%`;
-
-      track.appendChild(fill);
-      shell.appendChild(value);
-      shell.appendChild(track);
-      slot.tile.classList.add('is-pending');
-      slot.body.appendChild(shell);
+    slot.renderedUrl = '';
+    if (nextState === 'filtered') {
+      slot.label.textContent = text('webui.masonry.batchFiltered', '已过滤');
+      if (slot.renderedState !== nextState) slot.body.replaceChildren(slot.label);
+      slot.renderedState = nextState;
       return;
     }
 
-    slot.body.appendChild(label);
+    const progress = Math.max(0, Math.min(99, slot.progress || 0));
+    if (slot.renderedProgress !== progress) {
+      slot.progressValue.textContent = `${progress}%`;
+      slot.progressFill.style.width = `${progress}%`;
+      slot.renderedProgress = progress;
+    }
+    if (slot.renderedState !== nextState) slot.body.replaceChildren(slot.progressShell);
+    slot.renderedState = nextState;
+  }
+
+  function slotOutcome(slot) {
+    if (slot.url && !slot.moderated) return 'ready';
+    if (slot.moderated) return 'filtered';
+    return 'pending';
+  }
+
+  function updateBatchCounts(batch, previousOutcome, nextOutcome) {
+    if (previousOutcome === nextOutcome) return false;
+    if (previousOutcome === 'ready') batch.readyCount = Math.max(0, batch.readyCount - 1);
+    if (previousOutcome === 'filtered') batch.filteredCount = Math.max(0, batch.filteredCount - 1);
+    if (nextOutcome === 'ready') batch.readyCount += 1;
+    if (nextOutcome === 'filtered') batch.filteredCount += 1;
+    return true;
   }
 
   function findSlot(batch, payload) {
@@ -364,6 +411,7 @@
   function syncBatch(batch, payload) {
     const slot = findSlot(batch, payload);
     if (!slot) return;
+    const previousOutcome = slotOutcome(slot);
 
     if (payload.type === 'progress') {
       slot.progress = Number(payload.progress) || slot.progress || 0;
@@ -377,8 +425,10 @@
       slot.moderated = true;
     }
 
+    const nextOutcome = slotOutcome(slot);
+    const countsChanged = updateBatchCounts(batch, previousOutcome, nextOutcome);
     renderSlot(slot);
-    updateBatchMeta(batch);
+    if (countsChanged || payload.type !== 'progress') updateBatchMeta(batch);
   }
 
   function createStreamState(prompt, aspectRatio, quality, mode) {
@@ -470,8 +520,7 @@
 
       if (payload.type === 'progress' || payload.type === 'image' || payload.type === 'moderated') {
         syncBatch(batch, payload);
-        const ready = batch.slots.filter((slot) => slot.url && !slot.moderated).length;
-        setStatus(`${text('webui.masonry.statusGenerating', '生成中…')} ${ready}/${IMAGE_COUNT} · ${formatRoundLabel(batch.round)}`, 'running');
+        setStatus(`${text('webui.masonry.statusGenerating', '生成中…')} ${batch.readyCount}/${IMAGE_COUNT} · ${formatRoundLabel(batch.round)}`, 'running');
         return;
       }
 
@@ -666,7 +715,7 @@
     } catch {}
     activeSocket = null;
   });
-  window.addEventListener('resize', syncAllBatchGrids);
+  window.addEventListener('resize', scheduleAllBatchGridsSync);
 
   boot().catch((error) => {
     console.error('webui masonry boot failed', error);

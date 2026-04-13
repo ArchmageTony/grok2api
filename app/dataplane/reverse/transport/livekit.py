@@ -22,6 +22,7 @@ from app.dataplane.reverse.protocol.xai_livekit import (
 )
 from app.dataplane.reverse.transport.http import post_json
 from app.dataplane.reverse.transport.websocket import WebSocketClient, WebSocketConnection
+from app.dataplane.reverse.transport._proxy_feedback import upstream_feedback
 
 
 # ------------------------------------------------------------------
@@ -63,20 +64,10 @@ async def fetch_livekit_token(
             referer   = "https://grok.com/",
         )
     except UpstreamError as exc:
-        await proxy.feedback(
-            lease,
-            ProxyFeedback(
-                kind        = ProxyFeedbackKind.UPSTREAM_5XX if (exc.status or 0) >= 500
-                              else ProxyFeedbackKind.FORBIDDEN,
-                status_code = exc.status or 502,
-            ),
-        )
+        await proxy.feedback(lease, upstream_feedback(exc))
         raise
     except Exception as exc:
-        await proxy.feedback(
-            lease,
-            ProxyFeedback(kind=ProxyFeedbackKind.TRANSPORT_ERROR),
-        )
+        await proxy.feedback(lease, ProxyFeedback(kind=ProxyFeedbackKind.TRANSPORT_ERROR))
         raise UpstreamError(f"fetch_livekit_token: transport error: {exc}") from exc
 
     await proxy.feedback(
@@ -114,7 +105,7 @@ async def connect_livekit_ws(
     timeout = timeout_s if timeout_s is not None else cfg.get_float("voice.timeout", 120.0)
 
     proxy = await get_proxy_runtime()
-    lease = await proxy.acquire(scope=ProxyScope.APP, kind=RequestKind.WS)
+    lease = await proxy.acquire(scope=ProxyScope.APP, kind=RequestKind.WEBSOCKET)
 
     url     = build_ws_url(access_token)
     headers = build_ws_headers(token=token, lease=lease)

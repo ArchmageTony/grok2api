@@ -5,7 +5,6 @@ and updating quota / usage fields accordingly.
 """
 
 from dataclasses import dataclass, field
-from typing import Any
 
 from app.platform.runtime.clock import now_ms
 from .enums import AccountStatus, FeedbackKind
@@ -16,13 +15,14 @@ from .quota_defaults import default_quota_set
 # Policy
 # ---------------------------------------------------------------------------
 
+
 @dataclass(slots=True)
 class StatePolicy:
     """Configurable thresholds for automatic state transitions."""
 
-    fail_threshold:    int   = 5    # consecutive failures → COOLING
-    forbidden_strikes: int   = 1    # 403 count → DISABLED
-    default_cooling_ms: int  = 15 * 60 * 1000  # 15 min
+    fail_threshold: int = 5  # consecutive failures → COOLING
+    forbidden_strikes: int = 1  # 403 count → DISABLED
+    default_cooling_ms: int = 15 * 60 * 1000  # 15 min
 
 
 _DEFAULT_POLICY = StatePolicy()
@@ -31,6 +31,7 @@ _DEFAULT_POLICY = StatePolicy()
 # ---------------------------------------------------------------------------
 # Feedback
 # ---------------------------------------------------------------------------
+
 
 @dataclass(slots=True)
 class AccountFeedback:
@@ -41,15 +42,15 @@ class AccountFeedback:
     ``apply_usage`` — whether to increment usage_use_count on SUCCESS.
     """
 
-    kind:            FeedbackKind
-    mode_id:         int                 = 0
-    at:              int                 = field(default_factory=now_ms)
-    status_code:     int | None          = None
-    reason:          str                 = ""
-    quota_window:    QuotaWindow | None  = None  # real value from usage API
-    retry_after_ms:  int | None          = None
-    confirm_expired: bool                = False
-    apply_usage:     bool                = True
+    kind: FeedbackKind
+    mode_id: int = 0
+    at: int = field(default_factory=now_ms)
+    status_code: int | None = None
+    reason: str = ""
+    quota_window: QuotaWindow | None = None  # real value from usage API
+    retry_after_ms: int | None = None
+    confirm_expired: bool = False
+    apply_usage: bool = True
 
     @classmethod
     def from_status_code(
@@ -74,13 +75,13 @@ class AccountFeedback:
         else:
             kind = FeedbackKind.SERVER_ERROR
         return cls(
-            kind            = kind,
-            mode_id         = mode_id,
-            status_code     = status_code,
-            reason          = reason,
-            retry_after_ms  = retry_after_ms,
-            confirm_expired = confirm_expired,
-            apply_usage     = False,
+            kind=kind,
+            mode_id=mode_id,
+            status_code=status_code,
+            reason=reason,
+            retry_after_ms=retry_after_ms,
+            confirm_expired=confirm_expired,
+            apply_usage=False,
         )
 
 
@@ -88,12 +89,12 @@ class AccountFeedback:
 # State helpers
 # ---------------------------------------------------------------------------
 
-_COOLDOWN_UNTIL_KEY   = "cooldown_until"
-_COOLDOWN_REASON_KEY  = "cooldown_reason"
-_DISABLED_AT_KEY      = "disabled_at"
-_DISABLED_REASON_KEY  = "disabled_reason"
-_EXPIRED_AT_KEY       = "expired_at"
-_EXPIRED_REASON_KEY   = "expired_reason"
+_COOLDOWN_UNTIL_KEY = "cooldown_until"
+_COOLDOWN_REASON_KEY = "cooldown_reason"
+_DISABLED_AT_KEY = "disabled_at"
+_DISABLED_REASON_KEY = "disabled_reason"
+_EXPIRED_AT_KEY = "expired_at"
+_EXPIRED_REASON_KEY = "expired_reason"
 _FORBIDDEN_STRIKE_KEY = "forbidden_strikes"
 
 
@@ -110,7 +111,9 @@ def derive_status(record: AccountRecord, *, now: int | None = None) -> AccountSt
     return AccountStatus.COOLING
 
 
-def is_selectable(record: AccountRecord, mode_id: int, *, now: int | None = None) -> bool:
+def is_selectable(
+    record: AccountRecord, mode_id: int, *, now: int | None = None
+) -> bool:
     """Return True if the account can be selected for *mode_id*."""
     if record.is_deleted():
         return False
@@ -134,6 +137,7 @@ def is_manageable(record: AccountRecord, *, now: int | None = None) -> bool:
 # State transition
 # ---------------------------------------------------------------------------
 
+
 def apply_feedback(
     record: AccountRecord,
     feedback: AccountFeedback,
@@ -146,34 +150,34 @@ def apply_feedback(
     """
     ts = feedback.at
     ext = dict(record.ext)
-    qs  = record.quota_set()
+    qs = record.quota_set()
 
-    status           = record.status
-    last_fail_at     = record.last_fail_at
+    status = record.status
+    last_fail_at = record.last_fail_at
     last_fail_reason = record.last_fail_reason
-    last_use_at      = record.last_use_at
-    last_sync_at     = record.last_sync_at
-    use_count        = record.usage_use_count
-    fail_count       = record.usage_fail_count
-    sync_count       = record.usage_sync_count
-    state_reason     = record.state_reason
+    last_use_at = record.last_use_at
+    last_sync_at = record.last_sync_at
+    use_count = record.usage_use_count
+    fail_count = record.usage_fail_count
+    sync_count = record.usage_sync_count
+    state_reason = record.state_reason
 
     # Update quota window from real API data if provided.
     if feedback.quota_window is not None:
         qs.set(feedback.mode_id, feedback.quota_window)
         last_sync_at = ts
-        sync_count  += 1
+        sync_count += 1
     elif feedback.kind == FeedbackKind.SUCCESS:
         # Decrement locally when no real data is available.
         win = qs.get(feedback.mode_id)
         if win is not None:
             updated_win = QuotaWindow(
-                remaining      = max(0, win.remaining - 1),
-                total          = win.total,
-                window_seconds = win.window_seconds,
-                reset_at       = win.reset_at,
-                synced_at      = win.synced_at,
-                source         = win.source,
+                remaining=max(0, win.remaining - 1),
+                total=win.total,
+                window_seconds=win.window_seconds,
+                reset_at=win.reset_at,
+                synced_at=win.synced_at,
+                source=win.source,
             )
             qs.set(feedback.mode_id, updated_win)
     elif feedback.kind == FeedbackKind.RATE_LIMITED:
@@ -185,31 +189,38 @@ def apply_feedback(
                 if feedback.retry_after_ms
                 else (ts + win.window_seconds * 1000)
             )
-            qs.set(feedback.mode_id, QuotaWindow(
-                remaining      = 0,
-                total          = win.total,
-                window_seconds = win.window_seconds,
-                reset_at       = reset_at,
-                synced_at      = win.synced_at,
-                source         = win.source,
-            ))
+            qs.set(
+                feedback.mode_id,
+                QuotaWindow(
+                    remaining=0,
+                    total=win.total,
+                    window_seconds=win.window_seconds,
+                    reset_at=reset_at,
+                    synced_at=win.synced_at,
+                    source=win.source,
+                ),
+            )
 
     # Update usage counters.
     if feedback.kind == FeedbackKind.SUCCESS and feedback.apply_usage:
-        use_count   += 1
-        last_use_at  = ts
-    elif feedback.kind not in (FeedbackKind.SUCCESS, FeedbackKind.RESTORE,
-                               FeedbackKind.DISABLE, FeedbackKind.DELETE):
-        fail_count       += 1
-        last_fail_at      = ts
-        last_fail_reason  = feedback.reason or str(feedback.status_code or "")
+        use_count += 1
+        last_use_at = ts
+    elif feedback.kind not in (
+        FeedbackKind.SUCCESS,
+        FeedbackKind.RESTORE,
+        FeedbackKind.DISABLE,
+        FeedbackKind.DELETE,
+    ):
+        fail_count += 1
+        last_fail_at = ts
+        last_fail_reason = feedback.reason or str(feedback.status_code or "")
 
     # Status transitions.
     if feedback.kind == FeedbackKind.UNAUTHORIZED:
         if feedback.confirm_expired:
-            status       = AccountStatus.EXPIRED
+            status = AccountStatus.EXPIRED
             state_reason = feedback.reason or "token_expired"
-            ext[_EXPIRED_AT_KEY]     = ts
+            ext[_EXPIRED_AT_KEY] = ts
             ext[_EXPIRED_REASON_KEY] = state_reason
         else:
             # Unconfirmed 401 — only note failure; do not expire.
@@ -219,9 +230,9 @@ def apply_feedback(
         strikes = int(ext.get(_FORBIDDEN_STRIKE_KEY, 0)) + 1
         ext[_FORBIDDEN_STRIKE_KEY] = strikes
         if strikes >= policy.forbidden_strikes:
-            status       = AccountStatus.DISABLED
+            status = AccountStatus.DISABLED
             state_reason = feedback.reason or "forbidden"
-            ext[_DISABLED_AT_KEY]     = ts
+            ext[_DISABLED_AT_KEY] = ts
             ext[_DISABLED_REASON_KEY] = state_reason
 
     elif feedback.kind == FeedbackKind.RATE_LIMITED:
@@ -230,24 +241,25 @@ def apply_feedback(
             if feedback.retry_after_ms
             else policy.default_cooling_ms
         )
-        status       = AccountStatus.COOLING
+        status = AccountStatus.COOLING
         state_reason = feedback.reason or "rate_limited"
-        ext[_COOLDOWN_UNTIL_KEY]  = ts + cooldown_ms
+        ext[_COOLDOWN_UNTIL_KEY] = ts + cooldown_ms
         ext[_COOLDOWN_REASON_KEY] = state_reason
 
     elif feedback.kind == FeedbackKind.SUCCESS:
         if status == AccountStatus.COOLING:
             cooldown_until = ext.get(_COOLDOWN_UNTIL_KEY)
             if cooldown_until is not None and ts >= int(cooldown_until):
-                status       = AccountStatus.ACTIVE
+                status = AccountStatus.ACTIVE
                 state_reason = None
-                ext.pop(_COOLDOWN_UNTIL_KEY,  None)
+                ext.pop(_COOLDOWN_UNTIL_KEY, None)
                 ext.pop(_COOLDOWN_REASON_KEY, None)
+                ext.pop(_FORBIDDEN_STRIKE_KEY, None)
 
     elif feedback.kind == FeedbackKind.DISABLE:
-        status       = AccountStatus.DISABLED
+        status = AccountStatus.DISABLED
         state_reason = feedback.reason or "operator_disabled"
-        ext[_DISABLED_AT_KEY]     = ts
+        ext[_DISABLED_AT_KEY] = ts
         ext[_DISABLED_REASON_KEY] = state_reason
 
     elif feedback.kind == FeedbackKind.DELETE:
@@ -256,30 +268,30 @@ def apply_feedback(
     elif feedback.kind == FeedbackKind.RESTORE:
         status = AccountStatus.ACTIVE
         state_reason = None
-        ext.pop(_COOLDOWN_UNTIL_KEY,   None)
-        ext.pop(_COOLDOWN_REASON_KEY,  None)
-        ext.pop(_DISABLED_AT_KEY,      None)
-        ext.pop(_DISABLED_REASON_KEY,  None)
-        ext.pop(_EXPIRED_AT_KEY,       None)
-        ext.pop(_EXPIRED_REASON_KEY,   None)
+        ext.pop(_COOLDOWN_UNTIL_KEY, None)
+        ext.pop(_COOLDOWN_REASON_KEY, None)
+        ext.pop(_DISABLED_AT_KEY, None)
+        ext.pop(_DISABLED_REASON_KEY, None)
+        ext.pop(_EXPIRED_AT_KEY, None)
+        ext.pop(_EXPIRED_REASON_KEY, None)
         ext.pop(_FORBIDDEN_STRIKE_KEY, None)
         # Reset quota to defaults.
         qs = default_quota_set(record.pool)
 
     return record.model_copy(
         update={
-            "status":           status,
-            "quota":            qs.to_dict(),
-            "usage_use_count":  use_count,
+            "status": status,
+            "quota": qs.to_dict(),
+            "usage_use_count": use_count,
             "usage_fail_count": fail_count,
             "usage_sync_count": sync_count,
-            "last_use_at":      last_use_at,
-            "last_fail_at":     last_fail_at,
+            "last_use_at": last_use_at,
+            "last_fail_at": last_fail_at,
             "last_fail_reason": last_fail_reason,
-            "last_sync_at":     last_sync_at,
-            "state_reason":     state_reason,
-            "ext":              ext,
-            "updated_at":       ts,
+            "last_sync_at": last_sync_at,
+            "state_reason": state_reason,
+            "ext": ext,
+            "updated_at": ts,
         }
     )
 
@@ -288,21 +300,24 @@ def clear_failures(record: AccountRecord) -> AccountRecord:
     """Reset failure counters and restore ACTIVE status."""
     ext = dict(record.ext)
     for k in (
-        _COOLDOWN_UNTIL_KEY, _COOLDOWN_REASON_KEY,
-        _DISABLED_AT_KEY, _DISABLED_REASON_KEY,
-        _EXPIRED_AT_KEY, _EXPIRED_REASON_KEY,
+        _COOLDOWN_UNTIL_KEY,
+        _COOLDOWN_REASON_KEY,
+        _DISABLED_AT_KEY,
+        _DISABLED_REASON_KEY,
+        _EXPIRED_AT_KEY,
+        _EXPIRED_REASON_KEY,
         _FORBIDDEN_STRIKE_KEY,
     ):
         ext.pop(k, None)
     return record.model_copy(
         update={
-            "status":           AccountStatus.ACTIVE,
+            "status": AccountStatus.ACTIVE,
             "usage_fail_count": 0,
-            "last_fail_at":     None,
+            "last_fail_at": None,
             "last_fail_reason": None,
-            "state_reason":     None,
-            "ext":              ext,
-            "updated_at":       now_ms(),
+            "state_reason": None,
+            "ext": ext,
+            "updated_at": now_ms(),
         }
     )
 

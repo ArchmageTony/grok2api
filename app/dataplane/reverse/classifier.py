@@ -34,10 +34,14 @@ def classify_result(
         return ResultCategory.AUTH_FAILURE
 
     if status_code == 403:
+        # Known blocked/invalid account markers take precedence.
+        if is_invalid_credentials_body(body):
+            return ResultCategory.AUTH_FAILURE
         # Check if the body indicates a Cloudflare challenge.
         if body and ("cf-challenge" in body.lower() or "cloudflare" in body.lower()):
             return ResultCategory.FORBIDDEN
-        return ResultCategory.AUTH_FAILURE
+        # Generic 403 (suspension, WAF, etc.) — not a credential issue.
+        return ResultCategory.FORBIDDEN
 
     if status_code == 404:
         return ResultCategory.NOT_FOUND

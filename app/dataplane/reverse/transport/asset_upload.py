@@ -192,6 +192,14 @@ async def upload_from_input(token: str, file_input: str) -> tuple[str, str]:
                 resp = await session.get(file_input, headers=headers, timeout=30.0)
             raw  = resp.content
             if resp.status_code != 200:
+                await proxy.feedback(
+                    lease,
+                    ProxyFeedback(
+                        kind        = ProxyFeedbackKind.UPSTREAM_5XX if resp.status_code >= 500
+                                      else ProxyFeedbackKind.FORBIDDEN,
+                        status_code = resp.status_code,
+                    ),
+                )
                 raise UpstreamError(
                     f"Failed to fetch input URL: {resp.status_code}",
                     status = resp.status_code,
@@ -200,9 +208,13 @@ async def upload_from_input(token: str, file_input: str) -> tuple[str, str]:
                         or "application/octet-stream")
             filename = file_input.split("/")[-1].split("?")[0] or "download"
             b64      = base64.b64encode(raw).decode()
-        finally:
-            await proxy.feedback(lease, ProxyFeedback(kind=ProxyFeedbackKind.SUCCESS))
+        except UpstreamError:
+            raise
+        except Exception as exc:
+            await proxy.feedback(lease, ProxyFeedback(kind=ProxyFeedbackKind.TRANSPORT_ERROR))
+            raise UpstreamError(f"Asset fetch transport error: {exc}") from exc
 
+        await proxy.feedback(lease, ProxyFeedback(kind=ProxyFeedbackKind.SUCCESS))
         return await upload_file(token, filename, mime, b64)
 
     # Data URI

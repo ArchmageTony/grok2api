@@ -32,7 +32,11 @@
     return b||'zh';
   }
 
-  function get(o,k){ for(var p=k.split('.'),i=0;i<p.length;i++){if(o==null)return; o=o[p[i]];} return o; }
+  function get(o,k){
+    if(typeof k!=='string' || !k) return;
+    for(var p=k.split('.'),i=0;i<p.length;i++){if(o==null)return; o=o[p[i]];}
+    return o;
+  }
 
   function merge(base, extra){
     if(extra==null) return base;

@@ -30,6 +30,7 @@ def _get_delete_sem() -> asyncio.Semaphore:
     return _delete_sem
 from app.platform.errors import UpstreamError
 from app.control.proxy.models import ProxyFeedback, ProxyFeedbackKind, ProxyScope, RequestKind
+from app.dataplane.reverse.transport._proxy_feedback import upstream_feedback
 from app.dataplane.proxy import get_proxy_runtime
 from app.dataplane.reverse.protocol.xai_assets import (
     ASSETS_LIST_URL,
@@ -85,11 +86,7 @@ async def _list_assets_inner(
     except UpstreamError as exc:
         await proxy.feedback(
             lease,
-            ProxyFeedback(
-                kind        = ProxyFeedbackKind.UPSTREAM_5XX if (exc.status or 0) >= 500
-                              else ProxyFeedbackKind.FORBIDDEN,
-                status_code = exc.status or 502,
-            ),
+            upstream_feedback(exc),
         )
         raise
     except Exception as exc:
@@ -135,11 +132,7 @@ async def _delete_asset_inner(token: str, asset_id: str) -> dict:
     except UpstreamError as exc:
         await proxy.feedback(
             lease,
-            ProxyFeedback(
-                kind        = ProxyFeedbackKind.UPSTREAM_5XX if (exc.status or 0) >= 500
-                              else ProxyFeedbackKind.FORBIDDEN,
-                status_code = exc.status or 502,
-            ),
+            upstream_feedback(exc),
         )
         raise
     except Exception as exc:
@@ -208,11 +201,7 @@ async def download_asset(
     except UpstreamError as exc:
         await proxy.feedback(
             lease,
-            ProxyFeedback(
-                kind        = ProxyFeedbackKind.UPSTREAM_5XX if (exc.status or 0) >= 500
-                              else ProxyFeedbackKind.FORBIDDEN,
-                status_code = exc.status or 502,
-            ),
+            upstream_feedback(exc),
         )
         raise
     except Exception as exc:

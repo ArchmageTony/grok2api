@@ -22,8 +22,9 @@ import orjson
 
 from app.platform.logging.logger import logger
 from app.platform.config.snapshot import get_config
-from app.control.proxy.models import ProxyScope, RequestKind
+from app.control.proxy.models import ProxyFeedback, ProxyFeedbackKind, ProxyScope, RequestKind
 from app.dataplane.proxy import get_proxy_runtime
+from app.dataplane.reverse.transport._proxy_feedback import upstream_feedback
 from app.dataplane.proxy.adapters.headers import build_ws_headers
 from app.dataplane.reverse.protocol.xai_image import (
     WS_IMAGINE_URL,
@@ -319,6 +320,10 @@ async def stream_images(
         except Exception as exc:
             status = getattr(exc, "status", None)
             logger.error("imagine websocket connect failed: error={}", exc)
+            from app.platform.errors import UpstreamError as _UE
+            fb = upstream_feedback(_UE("connect failed", status=status)) \
+                if status else ProxyFeedback(kind=ProxyFeedbackKind.TRANSPORT_ERROR)
+            await proxy.feedback(lease, fb)
             yield {
                 "type":       "error",
                 "error_code": "rate_limit_exceeded" if status == 429 else "connection_failed",
@@ -348,6 +353,7 @@ async def stream_images(
                             collected += 1
                         yield ev
                         if ev["type"] == "error":
+                            await proxy.feedback(lease, ProxyFeedback(kind=ProxyFeedbackKind.TRANSPORT_ERROR))
                             return
                     else:
                         # _stream_round exhausted without a _meta — shouldn't happen
@@ -358,13 +364,17 @@ async def stream_images(
 
         except aiohttp.ClientError as exc:
             logger.error("imagine websocket connection failed: error={}", exc)
+            await proxy.feedback(lease, ProxyFeedback(kind=ProxyFeedbackKind.TRANSPORT_ERROR))
             yield {"type": "error", "error_code": "connection_failed", "error": str(exc)}
             return
 
         if collected >= n:
+            await proxy.feedback(lease, ProxyFeedback(kind=ProxyFeedbackKind.SUCCESS, status_code=200))
             return
 
         # Server closed the connection but we still need more images → reconnect.
+        # Give back the current lease before acquiring a new one on the next iteration.
+        await proxy.feedback(lease, ProxyFeedback(kind=ProxyFeedbackKind.SUCCESS, status_code=200))
         logger.info("imagine websocket reconnecting: remaining_images={} requested_images={}", n - collected, n)
 
 

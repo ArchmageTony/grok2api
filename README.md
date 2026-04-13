@@ -180,12 +180,17 @@ docker compose up -d
 | `ACCOUNT_REDIS_URL` | `redis` 模式 Redis DSN | `""` |
 | `ACCOUNT_MYSQL_URL` | `mysql` 模式 SQLAlchemy DSN | `""` |
 | `ACCOUNT_POSTGRESQL_URL` | `postgresql` 模式 SQLAlchemy DSN | `""` |
+| `ACCOUNT_SQL_POOL_SIZE` | SQL 连接池核心连接数 | `5` |
+| `ACCOUNT_SQL_MAX_OVERFLOW` | SQL 连接池最大溢出连接数 | `10` |
+| `ACCOUNT_SQL_POOL_TIMEOUT` | 等待连接池空闲连接的超时时间（秒） | `30` |
+| `ACCOUNT_SQL_POOL_RECYCLE` | 连接最大复用时间（秒），超时后自动重连 | `1800` |
 
 ### 系统配置项
 
 | 分组 | 关键项 |
 | :-- | :-- |
 | `app` | `app_key`, `app_url`, `api_key`, `webui_enabled`, `webui_key` |
+| `logging` | `file_level`, `max_files` |
 | `features` | `temporary`, `memory`, `stream`, `thinking`, `dynamic_statsig`, `enable_nsfw`, `custom_instruction`, `image_format`, `video_format` |
 | `proxy.egress` | `mode`, `proxy_url`, `proxy_pool`, `resource_proxy_url`, `resource_proxy_pool`, `skip_ssl_verify` |
 | `proxy.clearance` | `mode`, `cf_cookies`, `user_agent`, `browser`, `flaresolverr_url`, `timeout_sec`, `refresh_interval` |

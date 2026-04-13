@@ -5,9 +5,13 @@ only the DDL fragments and upsert syntax differ.
 """
 
 import json
+import os
 import ssl
+from threading import Lock
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+
+import asyncio
 
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
@@ -135,6 +139,10 @@ _MYSQL_SSL_MODE_ALIASES: dict[str, str] = {
     "verify_identity": "verify_identity",
 }
 
+_ENGINE_CACHE_LOCK = Lock()
+_ENGINE_CACHE: dict[tuple[str, str, str], AsyncEngine] = {}
+_ENGINE_KEYS_BY_ID: dict[int, set[tuple[str, str, str]]] = {}
+
 
 def _normalize_sql_url(dialect: str, url: str) -> str:
     """Rewrite SQL URLs to the async SQLAlchemy dialect form."""
@@ -155,6 +163,16 @@ def _normalize_sql_url(dialect: str, url: str) -> str:
     if url.startswith("pgsql://"):
         return f"postgresql+asyncpg://{url[len('pgsql://') :]}"
     return url
+
+
+def _get_env_int(name: str, default: int, *, minimum: int = 0) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return max(minimum, int(raw))
+    except ValueError:
+        return default
 
 
 def _normalize_ssl_mode(dialect: str, raw_mode: str) -> str:
@@ -314,11 +332,11 @@ def _build_sql_connect_args(
         return {"ssl": ctx} if ctx is not None else None
 
     _validate_pg_ssl_options(mode, ssl_options)
-    if _has_ssl_options(ssl_options, _PG_SSL_CERT_PARAM_KEYS):
-        return {"ssl": _build_pg_ssl_context(mode, ssl_options)}
     if mode == "disable":
         return None
-    return {"ssl": mode}
+    # asyncpg does not accept ssl= as a plain string (e.g. "require").
+    # Always build a proper ssl.SSLContext so the driver can use it directly.
+    return {"ssl": _build_pg_ssl_context(mode, ssl_options)}
 
 
 def _prepare_sql_url_and_connect_args(
@@ -332,6 +350,55 @@ def _prepare_sql_url_and_connect_args(
 
     cleaned_url, ssl_options = _extract_sql_ssl_options(dialect, normalized_url)
     return cleaned_url, _build_sql_connect_args(dialect, ssl_options)
+
+
+def _is_serverless() -> bool:
+    """Detect common serverless environments (Vercel, AWS Lambda, etc.)."""
+    return bool(
+        os.getenv("VERCEL")
+        or os.getenv("AWS_LAMBDA_FUNCTION_NAME")
+        or os.getenv("FUNCTIONS_WORKER_RUNTIME")  # Azure Functions
+    )
+
+
+def _sql_engine_kwargs(connect_args: dict[str, Any] | None) -> dict[str, Any]:
+    # In serverless environments each function instance is short-lived and may
+    # run concurrently.  Keep pools small to avoid exhausting DB connections.
+    serverless = _is_serverless()
+    kwargs: dict[str, Any] = {
+        "pool_size":    _get_env_int("ACCOUNT_SQL_POOL_SIZE",    1 if serverless else 5,  minimum=1),
+        "max_overflow": _get_env_int("ACCOUNT_SQL_MAX_OVERFLOW", 2 if serverless else 10, minimum=0),
+        "pool_timeout": _get_env_int("ACCOUNT_SQL_POOL_TIMEOUT", 30, minimum=1),
+        "pool_recycle": _get_env_int("ACCOUNT_SQL_POOL_RECYCLE", 1800, minimum=0),
+        "pool_pre_ping": True,
+        "pool_use_lifo": True,
+    }
+    if connect_args:
+        kwargs["connect_args"] = connect_args
+    return kwargs
+
+
+def _get_or_create_engine(
+    cache_key: tuple[str, str, str],
+    normalized_url: str,
+    connect_args: dict[str, Any] | None,
+) -> AsyncEngine:
+    with _ENGINE_CACHE_LOCK:
+        engine = _ENGINE_CACHE.get(cache_key)
+        if engine is not None:
+            return engine
+
+        engine = create_async_engine(normalized_url, **_sql_engine_kwargs(connect_args))
+        _ENGINE_CACHE[cache_key] = engine
+        _ENGINE_KEYS_BY_ID.setdefault(id(engine), set()).add(cache_key)
+        return engine
+
+
+def _evict_cached_engine(engine: AsyncEngine) -> None:
+    with _ENGINE_CACHE_LOCK:
+        for key in _ENGINE_KEYS_BY_ID.pop(id(engine), set()):
+            if _ENGINE_CACHE.get(key) is engine:
+                _ENGINE_CACHE.pop(key, None)
 
 
 def _row_to_record(row: Any) -> AccountRecord:
@@ -352,10 +419,19 @@ def _row_to_record(row: Any) -> AccountRecord:
 class SqlAccountRepository:
     """Async SQLAlchemy-based repository for MySQL / PostgreSQL."""
 
-    def __init__(self, engine: AsyncEngine, *, dialect: str = "mysql") -> None:
-        self._engine  = engine
-        self._dialect = dialect   # "mysql" | "postgresql"
-        self._session = async_sessionmaker(engine, expire_on_commit=False)
+    def __init__(
+        self,
+        engine: AsyncEngine,
+        *,
+        dialect: str = "mysql",
+        dispose_engine: bool = True,
+    ) -> None:
+        self._engine       = engine
+        self._dialect      = dialect   # "mysql" | "postgresql"
+        self._session      = async_sessionmaker(engine, expire_on_commit=False)
+        self._dispose_engine = dispose_engine
+        self._initialized  = False
+        self._init_lock    = asyncio.Lock()
 
     # ------------------------------------------------------------------
     # Revision helpers (run inside a transaction)
@@ -403,7 +479,23 @@ class SqlAccountRepository:
     # Public API
     # ------------------------------------------------------------------
 
-    async def initialize(self) -> None:
+    async def _ensure_initialized(self) -> None:
+        """Idempotent: create tables + seed revision row if not already done.
+
+        Safe to call on every request — short-circuits after first success so
+        repeated calls cost only an asyncio lock check.  This allows the
+        repository to self-initialise even when the ASGI lifespan is not
+        executed (e.g. Vercel serverless cold-starts).
+        """
+        if self._initialized:
+            return
+        async with self._init_lock:
+            if self._initialized:
+                return
+            await self._do_initialize()
+            self._initialized = True
+
+    async def _do_initialize(self) -> None:
         async with self._engine.begin() as conn:
             await conn.run_sync(metadata.create_all)
             # Seed revision row.
@@ -422,11 +514,16 @@ class SqlAccountRepository:
                     .on_duplicate_key_update(value="0")
                 )
 
+    async def initialize(self) -> None:
+        await self._ensure_initialized()
+
     async def get_revision(self) -> int:
+        await self._ensure_initialized()
         async with self._engine.connect() as conn:
             return await self._get_revision(conn)
 
     async def runtime_snapshot(self) -> RuntimeSnapshot:
+        await self._ensure_initialized()
         async with self._engine.connect() as conn:
             rev = await self._get_revision(conn)
             rows = (await conn.execute(
@@ -440,6 +537,7 @@ class SqlAccountRepository:
         *,
         limit: int = 5000,
     ) -> AccountChangeSet:
+        await self._ensure_initialized()
         async with self._engine.connect() as conn:
             rev = await self._get_revision(conn)
             rows = (await conn.execute(
@@ -469,6 +567,7 @@ class SqlAccountRepository:
     ) -> AccountMutationResult:
         if not items:
             return AccountMutationResult()
+        await self._ensure_initialized()
         async with self._engine.begin() as conn:
             rev = await self._bump_revision(conn)
             ts  = now_ms()
@@ -508,6 +607,7 @@ class SqlAccountRepository:
     ) -> AccountMutationResult:
         if not patches:
             return AccountMutationResult()
+        await self._ensure_initialized()
         async with self._engine.begin() as conn:
             rev = await self._bump_revision(conn)
             ts  = now_ms()
@@ -592,6 +692,7 @@ class SqlAccountRepository:
     ) -> AccountMutationResult:
         if not tokens:
             return AccountMutationResult()
+        await self._ensure_initialized()
         async with self._engine.begin() as conn:
             rev = await self._bump_revision(conn)
             ts  = now_ms()
@@ -611,6 +712,7 @@ class SqlAccountRepository:
     ) -> list[AccountRecord]:
         if not tokens:
             return []
+        await self._ensure_initialized()
         async with self._engine.connect() as conn:
             rows = (await conn.execute(
                 sa.select(accounts_table).where(accounts_table.c.token.in_(tokens))
@@ -621,6 +723,7 @@ class SqlAccountRepository:
         self,
         query: ListAccountsQuery,
     ) -> AccountPage:
+        await self._ensure_initialized()
         async with self._engine.connect() as conn:
             stmt = sa.select(accounts_table)
             if not query.include_deleted:
@@ -658,6 +761,7 @@ class SqlAccountRepository:
         self,
         command: BulkReplacePoolCommand,
     ) -> AccountMutationResult:
+        await self._ensure_initialized()
         async with self._engine.begin() as conn:
             rev = await self._bump_revision(conn)
             ts  = now_ms()
@@ -680,31 +784,27 @@ class SqlAccountRepository:
 
     async def close(self) -> None:
         """Dispose the SQLAlchemy connection pool."""
-        await self._engine.dispose()
+        if self._dispose_engine:
+            _evict_cached_engine(self._engine)
+            await self._engine.dispose()
+
+
+def _engine_cache_key(dialect: str, normalized_url: str, connect_args: dict[str, Any] | None) -> tuple[str, str, str]:
+    """Build a stable cache key from the normalized URL and connect args."""
+    args_key = str(sorted(connect_args.items(), key=lambda kv: kv[0])) if connect_args else ""
+    return (dialect, normalized_url, args_key)
 
 
 def create_mysql_engine(url: str) -> AsyncEngine:
     """Create an async SQLAlchemy engine for MySQL."""
-    normalized_url, connect_args = _prepare_sql_url_and_connect_args("mysql", url)
-    return create_async_engine(
-        normalized_url,
-        pool_size=10,
-        max_overflow=20,
-        pool_pre_ping=True,
-        **({"connect_args": connect_args} if connect_args else {}),
-    )
+    normalized_url, connect_args = _prepare_sql_url_and_connect_args("mysql", (url or "").strip())
+    return _get_or_create_engine(_engine_cache_key("mysql", normalized_url, connect_args), normalized_url, connect_args)
 
 
 def create_pgsql_engine(url: str) -> AsyncEngine:
     """Create an async SQLAlchemy engine for PostgreSQL."""
-    normalized_url, connect_args = _prepare_sql_url_and_connect_args("postgresql", url)
-    return create_async_engine(
-        normalized_url,
-        pool_size=10,
-        max_overflow=20,
-        pool_pre_ping=True,
-        **({"connect_args": connect_args} if connect_args else {}),
-    )
+    normalized_url, connect_args = _prepare_sql_url_and_connect_args("postgresql", (url or "").strip())
+    return _get_or_create_engine(_engine_cache_key("postgresql", normalized_url, connect_args), normalized_url, connect_args)
 
 
 __all__ = ["SqlAccountRepository", "create_mysql_engine", "create_pgsql_engine"]

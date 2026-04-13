@@ -1,10 +1,36 @@
 window.renderAdminHeader = async function renderAdminHeader() {
   const mount = document.getElementById('admin-header');
   if (!mount || mount.children.length) return;
+  const scriptVersion = (() => {
+    try {
+      const script = document.querySelector('script[src*="/static/js/admin-header.js"]');
+      if (!script) return 'v1';
+      return new URL(script.src, window.location.href).searchParams.get('v') || 'v1';
+    } catch {
+      return 'v1';
+    }
+  })();
+  const HEADER_HTML_CACHE_KEY = `grok2api.admin_header_html.${scriptVersion}`;
+  const META_VERSION_CACHE_KEY = `grok2api.meta_version.${scriptVersion}`;
   let appVersion = '';
   let updateInfo = null;
   let updateStatus = 'idle';
   let updatePromise = null;
+
+  const readSessionCache = (key) => {
+    try {
+      return sessionStorage.getItem(key) || '';
+    } catch {
+      return '';
+    }
+  };
+
+  const writeSessionCache = (key, value) => {
+    if (!value) return;
+    try {
+      sessionStorage.setItem(key, value);
+    } catch {}
+  };
 
   const languageCodes = {
     zh: 'CN',
@@ -85,11 +111,19 @@ window.renderAdminHeader = async function renderAdminHeader() {
   };
 
   const loadVersion = async () => {
+    const cachedVersion = window.__grok2apiMetaVersion || readSessionCache(META_VERSION_CACHE_KEY);
+    if (cachedVersion) {
+      appVersion = String(cachedVersion).trim();
+      window.__grok2apiMetaVersion = appVersion;
+      return;
+    }
     try {
-      const res = await fetch('/meta', { cache: 'no-store' });
+      const res = await fetch('/meta');
       if (!res.ok) throw new Error('meta unavailable');
       const data = await res.json();
       appVersion = String(data?.version || '').trim();
+      window.__grok2apiMetaVersion = appVersion;
+      writeSessionCache(META_VERSION_CACHE_KEY, appVersion);
     } catch {
       appVersion = '';
     }
@@ -529,9 +563,17 @@ window.renderAdminHeader = async function renderAdminHeader() {
   await loadVersion();
 
   try {
-    const res = await fetch('/static/admin/header.html', { cache: 'no-store' });
-    if (!res.ok) throw new Error('header unavailable');
-    mount.innerHTML = await res.text();
+    const cachedHtml = window.__grok2apiAdminHeaderHtml || readSessionCache(HEADER_HTML_CACHE_KEY);
+    if (cachedHtml) {
+      mount.innerHTML = cachedHtml;
+    } else {
+      const res = await fetch('/static/admin/header.html');
+      if (!res.ok) throw new Error('header unavailable');
+      const html = await res.text();
+      mount.innerHTML = html;
+      window.__grok2apiAdminHeaderHtml = html;
+      writeSessionCache(HEADER_HTML_CACHE_KEY, html);
+    }
   } catch {
     mount.innerHTML = `
       <header class="admin-header">

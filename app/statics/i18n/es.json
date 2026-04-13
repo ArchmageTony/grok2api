@@ -334,7 +334,8 @@
         "clearance": "Cloudflare Clearance",
         "retry": "Política de reintentos",
         "timeouts": "Tiempos de espera",
-        "imageProtocol": "NSFW y transmisión de imágenes"
+        "imageProtocol": "NSFW y transmisión de imágenes",
+        "logging": "Registro"
       },
       "options": {
         "imageFormat": {
@@ -413,7 +414,9 @@
         "assetListTimeout": { "label": "Tiempo de espera de listado de Asset (s)" },
         "assetDeleteTimeout": { "label": "Tiempo de espera de eliminación de Asset (s)" },
         "streamTimeout": { "label": "Tiempo de espera de inactividad en streaming (s)" },
-        "interRoundWait": { "label": "Espera entre rondas (s)" }
+        "interRoundWait": { "label": "Espera entre rondas (s)" },
+        "fileLogLevel": { "label": "Nivel de registro en archivo", "desc": "Nivel mínimo escrito en archivos de registro, configurable independientemente de la consola. Por defecto: INFO." },
+        "logMaxFiles": { "label": "Retención de registros (días)", "desc": "Número máximo de archivos de registro diarios a conservar durante la rotación. Por defecto: 7." }
       }
     }
   },

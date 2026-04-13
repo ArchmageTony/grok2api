@@ -12,12 +12,12 @@ from app.platform.logging.logger import logger
 from app.platform.runtime.clock import now_s
 from app.control.account.repository import AccountRepository
 from app.control.account.enums import FeedbackKind
-from .table import AccountRuntimeTable, make_empty_table
+from .table import AccountRuntimeTable
 from .lease import AccountLease, new_lease
 from .selector import select
 from .sync import bootstrap as _bootstrap, apply_changes
 from . import feedback as fb
-from ..shared.enums import POOL_STR_TO_ID, StatusId
+from ..shared.enums import StatusId
 
 if TYPE_CHECKING:
     pass
@@ -35,9 +35,9 @@ class AccountDirectory:
     """
 
     def __init__(self, repository: AccountRepository) -> None:
-        self._repo  = repository
+        self._repo = repository
         self._table: AccountRuntimeTable | None = None
-        self._lock  = asyncio.Lock()
+        self._lock = asyncio.Lock()
         self._sync_lock = asyncio.Lock()
 
     # ------------------------------------------------------------------
@@ -68,7 +68,8 @@ class AccountDirectory:
             if changed:
                 logger.debug(
                     "account directory synced: revision={} size={}",
-                    table.revision, table.size,
+                    table.revision,
+                    table.size,
                 )
             return changed
 
@@ -82,8 +83,8 @@ class AccountDirectory:
         mode_id: int,
         *,
         exclude_tokens: list[str] | None = None,
-        prefer_tags:    list[str] | None  = None,
-        now_s_override: int | None        = None,
+        prefer_tags: list[str] | None = None,
+        now_s_override: int | None = None,
     ) -> AccountLease | None:
         """Select and reserve the best available account slot.
 
@@ -104,14 +105,18 @@ class AccountDirectory:
         # Resolve exclude set (O(n) once, before lock).
         exclude_idxs: frozenset[int] | None = None
         if exclude_tokens:
-            idxs = [table.idx_by_token[t] for t in exclude_tokens if t in table.idx_by_token]
+            idxs = [
+                table.idx_by_token[t] for t in exclude_tokens if t in table.idx_by_token
+            ]
             if idxs:
                 exclude_idxs = frozenset(idxs)
 
         # Resolve tag preference set.
         prefer_tag_idxs: set[int] | None = None
         if prefer_tags:
-            sets = [table.tag_idx.get(tag) for tag in prefer_tags if tag in table.tag_idx]
+            sets = [
+                table.tag_idx.get(tag) for tag in prefer_tags if tag in table.tag_idx
+            ]
             if sets:
                 prefer_tag_idxs = set().union(*sets)
 
@@ -122,9 +127,9 @@ class AccountDirectory:
                     table,
                     pool_id,
                     mode_id,
-                    exclude_idxs    = exclude_idxs,
-                    prefer_tag_idxs = prefer_tag_idxs,
-                    now_s           = ts,
+                    exclude_idxs=exclude_idxs,
+                    prefer_tag_idxs=prefer_tag_idxs,
+                    now_s=ts,
                 )
                 if idx is not None:
                     break
@@ -134,15 +139,15 @@ class AccountDirectory:
 
             fb.increment_inflight(table, idx)
             fb.update_last_use(table, idx, ts)
-            token        = table.get_token(idx)
-            actual_pool  = table.get_pool_id(idx)
+            token = table.get_token(idx)
+            actual_pool = table.get_pool_id(idx)
 
         return new_lease(
-            idx         = idx,
-            token       = token,
-            pool_id     = actual_pool,
-            mode_id     = mode_id,
-            selected_at = ts,
+            idx=idx,
+            token=token,
+            pool_id=actual_pool,
+            mode_id=mode_id,
+            selected_at=ts,
         )
 
     async def release(self, lease: AccountLease) -> None:
@@ -159,13 +164,13 @@ class AccountDirectory:
 
     async def feedback(
         self,
-        token:        str,
-        kind:         FeedbackKind,
-        mode_id:      int,
+        token: str,
+        kind: FeedbackKind,
+        mode_id: int,
         *,
-        remaining:    int | None = None,
-        reset_at_ms:  int | None = None,
-        now_s_val:    int | None = None,
+        remaining: int | None = None,
+        reset_at_ms: int | None = None,
+        now_s_val: int | None = None,
     ) -> None:
         """Apply upstream response feedback to the account slot."""
         table = self._table
@@ -196,6 +201,7 @@ class AccountDirectory:
                 fb.update_last_fail(table, idx, ts)
 
             elif kind == FeedbackKind.SERVER_ERROR:
+                fb.apply_server_error(table, idx)
                 fb.update_last_fail(table, idx, ts)
 
             # Apply authoritative quota data from upstream response headers.
@@ -223,7 +229,9 @@ class AccountDirectory:
 _directory: AccountDirectory | None = None
 
 
-async def get_account_directory(repository: AccountRepository | None = None) -> AccountDirectory:
+async def get_account_directory(
+    repository: AccountRepository | None = None,
+) -> AccountDirectory:
     """Return the module-level AccountDirectory, bootstrapping on first call.
 
     After first initialization, ``repository`` may be omitted.
@@ -231,7 +239,9 @@ async def get_account_directory(repository: AccountRepository | None = None) -> 
     global _directory
     if _directory is None:
         if repository is None:
-            raise RuntimeError("AccountDirectory not bootstrapped — repository required on first call")
+            raise RuntimeError(
+                "AccountDirectory not bootstrapped — repository required on first call"
+            )
         _directory = AccountDirectory(repository)
         await _directory.bootstrap()
     return _directory
