@@ -30,7 +30,6 @@ class ChatCompletionRequest(BaseModel):
     model:               str
     messages:            list[MessageItem]
     stream:              bool | None                = None
-    thinking:            bool | None                = None
     reasoning_effort:    str | None                 = None
     temperature:         float | None               = 0.8
     top_p:               float | None               = 0.95
@@ -40,6 +39,9 @@ class ChatCompletionRequest(BaseModel):
     tool_choice:         str | dict[str, Any] | None = None
     parallel_tool_calls: bool | None                = True
     max_tokens:          int | None                 = None
+    deepsearch:          Literal["default", "deeper"] | None = Field(
+        None, description="深度搜索预设: default/deeper"
+    )
 
 
 class ImageGenerationRequest(BaseModel):
