@@ -28,7 +28,7 @@ async def post_stream(
 
     Raises ``UpstreamError`` on non-200 status.
     """
-    headers = build_http_headers(
+    headers = await build_http_headers(
         token,
         content_type=content_type,
         origin=origin,
@@ -103,7 +103,7 @@ async def post_json(
     Pass *session* to reuse an existing connection (avoids a new TLS handshake).
     When *session* is ``None`` a fresh session is created and closed automatically.
     """
-    headers = build_http_headers(
+    headers = await build_http_headers(
         token,
         content_type=content_type,
         origin=origin,
@@ -148,7 +148,7 @@ async def get_json(
     referer: str = "https://grok.com/",
 ) -> dict:
     """GET *url* and return parsed JSON response body."""
-    headers = build_http_headers(
+    headers = await build_http_headers(
         token,
         content_type="application/json",
         origin=origin,
@@ -197,7 +197,7 @@ async def delete_json(
     referer: str = "https://grok.com/",
 ) -> dict:
     """DELETE *url* and return parsed JSON response body (may be empty → {})."""
-    headers = build_http_headers(
+    headers = await build_http_headers(
         token,
         content_type="application/json",
         origin=origin,
@@ -254,7 +254,7 @@ async def get_bytes_stream(
     # Asset downloads hit the CDN (assets.grok.com) with a unique path per file;
     # statsig is not validated there, so skip signing to avoid a per-download
     # signer round-trip (falls back to the built-in placeholder value).
-    headers = build_http_headers(
+    headers = await build_http_headers(
         token,
         content_type=None,
         origin=origin,

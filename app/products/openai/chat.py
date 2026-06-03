@@ -403,7 +403,7 @@ async def _stream_chat(
     )
     payload_bytes = orjson.dumps(payload)
 
-    headers = build_http_headers(
+    headers = await build_http_headers(
         token,
         content_type="application/json",
         origin="https://grok.com",

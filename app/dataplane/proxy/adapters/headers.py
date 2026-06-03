@@ -3,6 +3,7 @@
 All values are sanitized to ASCII-safe Latin-1 before use.
 """
 
+import asyncio
 import base64
 import json
 import random
@@ -114,49 +115,79 @@ def _fetch_remote_statsig(
 
 
 def _fake_statsig_id(cfg) -> str:
+    # 前缀必须是 x1: —— grok 前端 Statsig 评估失败时回退到 btoa("x1:" + error)，
+    # 新版反爬严格校验该格式，老的 e: 前缀已被识破直接 403。
     if cfg.get_bool("features.dynamic_statsig", False):
         if random.choice((True, False)):
             rand = "".join(random.choices(string.ascii_lowercase + string.digits, k=5))
-            msg = f"e:TypeError: Cannot read properties of null (reading 'children['{rand}']')"
+            msg = f"x1:TypeError: Cannot read properties of null (reading 'children[\\'{rand}\\']')"
         else:
             rand = "".join(random.choices(string.ascii_lowercase, k=10))
-            msg = f"e:TypeError: Cannot read properties of undefined (reading '{rand}')"
+            msg = f"x1:TypeError: Cannot read properties of undefined (reading '{rand}')"
         return base64.b64encode(msg.encode()).decode()
     return (
-        "ZTpUeXBlRXJyb3I6IENhbm5vdCByZWFkIHByb3BlcnRpZXMgb2YgdW5kZWZpbmVkIChyZWFkaW5nICdjaGls"
-        "ZE5vZGVzJyk="
+        "eDE6VHlwZUVycm9yOiBDYW5ub3QgcmVhZCBwcm9wZXJ0aWVzIG9mIHVuZGVmaW5lZCAocmVhZGluZyAn"
+        "Y2hpbGROb2Rlcycp"
     )
 
 
-def _statsig_id(path: str = "", method: str = "POST") -> str:
-    """Resolve x-statsig-id.
+# Per-key single-flight locks: collapse concurrent cache misses on the same
+# path into one signer call. Lazily created inside the running loop. Some paths
+# embed an id (e.g. asset deletes), so the key set is unbounded — cap the dict
+# and evict currently-unheld locks when it grows too large.
+_SIG_LOCKS: dict[str, asyncio.Lock] = {}
+_SIG_LOCKS_MAX = 512
 
-    With ``statsig.signer_url`` configured and a non-empty *path*, fetch a real
-    signature from the signer service (with a short client-side cache); on any
-    failure fall back to the built-in fake value (legacy behaviour).
+
+async def resolve_statsig_id(path: str = "", method: str = "POST") -> str:
+    """Async counterpart of :func:`_statsig_id`.
+
+    Same cache/cooldown semantics, but the (CPU-bound, possibly slow) signer
+    request runs in a thread so it never blocks the event loop, and a per-path
+    single-flight lock ensures the signer is hit at most once per TTL regardless
+    of concurrency.
     """
     global _SIGNER_FAIL_UNTIL
     cfg = get_config()
     signer_url = cfg.get_str("statsig.signer_url", "").strip()
-    if signer_url and path:
-        ttl = cfg.get_float("statsig.cache_ttl", 20.0)
-        key = f"{method}|{path}"
+    if not (signer_url and path):
+        return _fake_statsig_id(cfg)
+
+    ttl = cfg.get_float("statsig.cache_ttl", 20.0)
+    key = f"{method}|{path}"
+    now = time.monotonic()
+    if ttl > 0:
+        cached = _SIG_CACHE.get(key)
+        if cached and cached[1] > now:
+            return cached[0]
+
+    lock = _SIG_LOCKS.get(key)
+    if lock is None:
+        if len(_SIG_LOCKS) >= _SIG_LOCKS_MAX:
+            for k in [k for k, lk in _SIG_LOCKS.items() if not lk.locked()]:
+                _SIG_LOCKS.pop(k, None)
+        lock = asyncio.Lock()
+        _SIG_LOCKS[key] = lock
+
+    async with lock:
+        # Re-check: a prior holder of the lock may have just populated the cache.
         now = time.monotonic()
         if ttl > 0:
             cached = _SIG_CACHE.get(key)
             if cached and cached[1] > now:
                 return cached[0]
-        # Skip the remote call while in the post-failure cooldown window.
         if now >= _SIGNER_FAIL_UNTIL:
             timeout = cfg.get_float("statsig.timeout", 5.0)
-            sig = _fetch_remote_statsig(signer_url, path, method, timeout)
+            loop = asyncio.get_running_loop()
+            sig = await loop.run_in_executor(
+                None, _fetch_remote_statsig, signer_url, path, method, timeout
+            )
             if sig:
                 _SIGNER_FAIL_UNTIL = 0.0
                 if ttl > 0:
                     _cache_put(key, sig, now + ttl)
                 return sig
             _SIGNER_FAIL_UNTIL = now + cfg.get_float("statsig.fail_cooldown", 5.0)
-        # Signer unconfigured / failing → degrade to the fake value, don't abort.
     return _fake_statsig_id(cfg)
 
 
@@ -297,7 +328,7 @@ def build_sso_cookie(
     return cookie
 
 
-def build_http_headers(
+async def build_http_headers(
     cookie_token: str,
     *,
     content_type: Optional[str] = None,
@@ -355,7 +386,9 @@ def build_http_headers(
         "Sec-Fetch-Mode": "cors",
         "Sec-Fetch-Site": site,
         "User-Agent": ua,
-        "x-statsig-id": _statsig_id(urlparse(url).path if url else "", method),
+        "x-statsig-id": await resolve_statsig_id(
+            urlparse(url).path if url else "", method
+        ),
         "x-xai-request-id": str(uuid.uuid4()),
     }
     headers.update(_client_hints(browser, raw_ua))

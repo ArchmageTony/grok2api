@@ -125,7 +125,7 @@ async def _upload_file_inner(
         "fileMimeType": mime,
         "content":      b64,
     })
-    headers = build_http_headers(token, lease=lease, url=_UPLOAD_URL, method="POST")
+    headers = await build_http_headers(token, lease=lease, url=_UPLOAD_URL, method="POST")
     kwargs  = build_session_kwargs(lease=lease)
 
     try:
@@ -186,7 +186,7 @@ async def upload_from_input(token: str, file_input: str) -> tuple[str, str]:
         proxy = await get_proxy_runtime()
         lease = await proxy.acquire()
         try:
-            headers = build_http_headers(token, lease=lease)
+            headers = await build_http_headers(token, lease=lease)
             kwargs  = build_session_kwargs(lease=lease)
             async with ResettableSession(**kwargs) as session:
                 resp = await session.get(file_input, headers=headers, timeout=30.0)

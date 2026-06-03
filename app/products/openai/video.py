@@ -327,7 +327,7 @@ async def _stream_video_request(
 ) -> AsyncGenerator[str, None]:
     proxy = await get_proxy_runtime()
     lease = await proxy.acquire()
-    headers = build_http_headers(
+    headers = await build_http_headers(
         token,
         content_type="application/json",
         origin="https://grok.com",
