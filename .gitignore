@@ -53,3 +53,7 @@ htmlcov/
 
 # Project specific
 .ace-tool/
+.playwright-mcp/
+CLAUDE.md
+STATSIG_SIGNER_PLAN.md
+docs/grok_signer_factory.dump.js
