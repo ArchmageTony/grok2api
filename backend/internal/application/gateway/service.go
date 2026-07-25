@@ -766,10 +766,25 @@ attemptLoop:
 			// Restore the consumed final non-blocking 403 body for the common response path.
 			response.Body = io.NopCloser(bytes.NewReader(body))
 		}
+		// Rewrite HTTP 200 capacity soft-errors (stream or non-stream) to 429 before any
+		// client headers are written, so account rotation can still run.
+		softCapacity := rewriteSoftCapacityResponse(response)
 		if isRetryableResponse(response, route.Provider) && !finalEgressForbidden {
 			retryAfter := parseRetryAfter(response.Header.Get("Retry-After"), time.Now().UTC())
 			body, _ := readRetryableBody(response.Body)
 			lastFailure = newHTTPUpstreamFailure(response.StatusCode, body, credential.ID, credential.Name)
+			if softCapacity {
+				// Model capacity is not account-scoped: rotate without MarkFailure / quota exhaustion.
+				applySoftCapacityFailure(lastFailure)
+				lease.Release()
+				lastErr = fmt.Errorf("上游模型容量不足")
+				s.logger.Warn("upstream_model_capacity", "request_id", input.RequestID, "account_id", credential.ID, "provider", credential.Provider, "status", lastFailure.HTTPStatus, "fingerprint", lastFailure.Fingerprint)
+				failureFingerprints[lastFailure.Fingerprint]++
+				if failureFingerprints[lastFailure.Fingerprint] >= 2 {
+					break
+				}
+				continue
+			}
 			buildForbiddenReauth := credential.Provider == accountdomain.ProviderBuild && s.shouldInvalidateBuildForbidden(lastFailure)
 			if buildForbiddenReauth {
 				lastFailure.AccountScoped = true
