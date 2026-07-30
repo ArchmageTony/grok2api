@@ -113,6 +113,7 @@ type Result struct {
 	Status              string
 	Header              http.Header
 	Body                io.ReadCloser
+	MarkFirstToken      func()
 	RecordStreamFailure func(StreamFailureDiagnostic)
 	Finalize            func(usage Usage, responseID, errorCode string)
 }
@@ -509,7 +510,9 @@ func (s *Service) selectConversationRoute(routes []modeldomain.Route, key client
 		return modeldomain.Route{}, ErrModelNotFound
 	}
 	fallback := routes[0]
+	accountScope := key.AccountScope()
 	matchedOwnership := ownership == nil
+	scopeMatched := false
 	allowed := false
 	conversationSupported := false
 	storedResponseUnsupported := false
@@ -519,6 +522,10 @@ func (s *Service) selectConversationRoute(routes []modeldomain.Route, key client
 		}
 		matchedOwnership = true
 		fallback = route
+		if !accountScope.AllowsProvider(route.Provider) {
+			continue
+		}
+		scopeMatched = true
 		if !s.clientKeys.CanUseModel(key, route.ID) {
 			continue
 		}
@@ -539,6 +546,9 @@ func (s *Service) selectConversationRoute(routes []modeldomain.Route, key client
 	if !matchedOwnership {
 		return fallback, ErrResponseAccountUnavailable
 	}
+	if !scopeMatched {
+		return fallback, &SelectionUnavailableError{Reason: SelectionNoAccounts, Scope: accountScope}
+	}
 	if !allowed {
 		return fallback, clientkeyapp.ErrModelNotAllowed
 	}
@@ -557,7 +567,9 @@ func (s *Service) selectMediaRoute(routes []modeldomain.Route, key clientkey.Key
 		return modeldomain.Route{}, ErrModelNotFound
 	}
 	fallback := routes[0]
+	accountScope := key.AccountScope()
 	capabilityMatched := false
+	scopeMatched := false
 	allowed := false
 	for _, route := range routes {
 		if route.Capability != capability {
@@ -565,6 +577,10 @@ func (s *Service) selectMediaRoute(routes []modeldomain.Route, key clientkey.Key
 		}
 		fallback = route
 		capabilityMatched = true
+		if !accountScope.AllowsProvider(route.Provider) {
+			continue
+		}
+		scopeMatched = true
 		if !s.clientKeys.CanUseModel(key, route.ID) {
 			continue
 		}
@@ -576,6 +592,9 @@ func (s *Service) selectMediaRoute(routes []modeldomain.Route, key clientkey.Key
 	if !capabilityMatched {
 		return fallback, ErrModelNotFound
 	}
+	if !scopeMatched {
+		return fallback, &SelectionUnavailableError{Reason: SelectionNoAccounts, Scope: accountScope}
+	}
 	if !allowed {
 		return fallback, clientkeyapp.ErrModelNotAllowed
 	}
@@ -585,6 +604,10 @@ func (s *Service) selectMediaRoute(routes []modeldomain.Route, key clientkey.Key
 func (s *Service) createResponseAt(ctx context.Context, input Input, path string) (*Result, error) {
 	ctx, egressTrace := infraegress.WithTrace(ctx)
 	startedAt := time.Now()
+	var firstToken *firstTokenTimer
+	if input.Streaming {
+		firstToken = newFirstTokenTimer(startedAt)
+	}
 	eventID := newAuditEventID()
 	operation := input.Operation
 	if operation == "" {
@@ -714,6 +737,7 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 	failureFingerprints := make(map[string]int)
 	authRecoveryAttempted := make(map[uint64]bool)
 	quotaMode := s.providers.QuotaMode(route.Provider, route.UpstreamModel)
+	accountScope := input.ClientKey.AccountScope()
 	quotaProbeAttempted := false
 	var lastErr error
 	var lastFailure *UpstreamFailure
@@ -741,9 +765,9 @@ attemptLoop:
 		var err error
 		selectionStarted := time.Now()
 		if ownership != nil {
-			lease, err = s.selector.AcquirePinned(ctx, route.Provider, ownership.AccountID, route.ID, route.UpstreamModel, quotaMode, true)
+			lease, err = s.selector.AcquirePinnedForKey(ctx, route.Provider, ownership.AccountID, route.ID, route.UpstreamModel, quotaMode, true, accountScope)
 		} else {
-			lease, err = s.selector.Acquire(ctx, route.Provider, route.ID, route.UpstreamModel, quotaMode, affinityKey, excluded, !quotaProbeAttempted)
+			lease, err = s.selector.AcquireForKey(ctx, route.Provider, route.ID, route.UpstreamModel, quotaMode, affinityKey, excluded, !quotaProbeAttempted, accountScope)
 		}
 		timing.markSelection(time.Since(selectionStarted))
 		if err != nil {
@@ -1072,14 +1096,15 @@ attemptLoop:
 			once.Do(func() {
 				successful := response.StatusCode >= 200 && response.StatusCode < 300 && errorCode == ""
 				lease.completeSelectorObservation(successful)
-				lease.Release()
 				budget := newFinalizationBudget(string(operation), string(route.Provider))
 				if isUpstreamStreamFailure(errorCode) {
-					_ = budget.run("account_health", finalizationHealthBudget, func(stageCtx context.Context) error {
-						s.selector.MarkFailure(stageCtx, credential, http.StatusBadGateway, 0)
-						return nil
-					})
+					if err := budget.run("account_health", finalizationHealthBudget, func(stageCtx context.Context) error {
+						return s.selector.MarkFailureAfterSuccess(stageCtx, credential, http.StatusBadGateway, 0)
+					}); err != nil {
+						s.logger.Warn("stream_failure_health_write_failed", "account_id", credential.ID, "provider", credential.Provider, "error", err)
+					}
 				}
+				lease.Release()
 				now := time.Now().UTC()
 				record := auditBase
 				record.AccountID = &accountID
@@ -1109,6 +1134,9 @@ attemptLoop:
 				record.NumServerSideToolsUsed = usage.NumServerSideToolsUsed
 				record.ContextInputTokens = usage.ContextInputTokens
 				record.ContextOutputTokens = usage.ContextOutputTokens
+				if successful && input.Streaming {
+					record.FirstTokenMS = firstToken.milliseconds()
+				}
 				record.DurationMS = time.Since(startedAt).Milliseconds()
 				record.ErrorCode = errorCode
 				attempts := failureAttempts.snapshot()
@@ -1167,8 +1195,12 @@ attemptLoop:
 		recordStreamFailure := func(diagnostic StreamFailureDiagnostic) {
 			failureAttempts.captureStreamFailure(credential, responseStartedAt, response, diagnostic)
 		}
+		var markFirstToken func()
+		if firstToken != nil {
+			markFirstToken = firstToken.mark
+		}
 		timingHandedOff = true
-		return &Result{StatusCode: response.StatusCode, Status: response.Status, Header: response.Header, Body: &finalizingBody{ReadCloser: response.Body, finalize: func() { finalize(Usage{}, "", "stream_closed") }}, RecordStreamFailure: recordStreamFailure, Finalize: finalize}, nil
+		return &Result{StatusCode: response.StatusCode, Status: response.Status, Header: response.Header, Body: &finalizingBody{ReadCloser: response.Body, finalize: func() { finalize(Usage{}, "", "stream_closed") }}, MarkFirstToken: markFirstToken, RecordStreamFailure: recordStreamFailure, Finalize: finalize}, nil
 	}
 	if lastFailure != nil {
 		record := auditBase
@@ -1369,6 +1401,10 @@ func (s *Service) forwardOwnedResponse(ctx context.Context, input ResourceInput,
 		_ = s.responses.Delete(ctx, input.ResponseID, input.ClientKey.ID)
 		return nil, ErrResponseNotFound
 	}
+	accountScope := input.ClientKey.AccountScope()
+	if !accountScope.AllowsProvider(ownership.Provider) {
+		return nil, &SelectionUnavailableError{Reason: SelectionNoAccounts, Scope: accountScope}
+	}
 	adapter, ok := s.providers.Responses(ownership.Provider)
 	if !ok {
 		return nil, ErrResponseAccountUnavailable
@@ -1378,7 +1414,7 @@ func (s *Service) forwardOwnedResponse(ctx context.Context, input ResourceInput,
 		operation = "response_delete"
 	}
 	physicalCallCtx := infraegress.WithPhysicalCallTrace(ctx, string(ownership.Provider), operation)
-	lease, err := s.selector.AcquirePinned(ctx, ownership.Provider, ownership.AccountID, 0, "", "", false)
+	lease, err := s.selector.AcquirePinnedForKey(ctx, ownership.Provider, ownership.AccountID, 0, "", "", false, accountScope)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrResponseAccountUnavailable, err)
 	}
