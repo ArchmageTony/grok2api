@@ -125,6 +125,13 @@ func newHTTPUpstreamFailure(status int, body []byte, accountID uint64, accountNa
 	case http.StatusForbidden:
 		failure.Code = "upstream_forbidden"
 		failure.PublicMessage = "上游拒绝了该请求"
+		// Console's DPoP requirement is an upstream auth-scheme rollout, not a
+		// property of the selected SSO account. Rotating accounts or browser
+		// egress cannot make the same Bearer-anonymous request valid.
+		if isDPoPProofRequired(upstreamCode) {
+			failure.RequestScopedForbidden = true
+			break
+		}
 		// Safety denials are request-scoped: inspect both structured metadata and the raw body
 		// so SAFETY_CHECK_TYPE_* markers still match when they only appear in nested text.
 		if isSafetyRejection(metadataText) || isSafetyRejection(string(body)) {
@@ -172,6 +179,8 @@ func newTransportUpstreamFailure(err error, accountID uint64, accountName string
 	status := http.StatusBadGateway
 	if neterrorpkg.IsResponseHeaderTimeout(err) {
 		status, code, message = http.StatusGatewayTimeout, "upstream_header_timeout", "等待上游响应头超时"
+	} else if neterrorpkg.IsUpstreamStreamIdleTimeout(err) {
+		status, code, message = http.StatusGatewayTimeout, "upstream_stream_idle_timeout", "上游流式响应长时间无数据"
 	} else if errors.Is(err, context.DeadlineExceeded) {
 		code, message = "upstream_timeout", "上游服务响应超时"
 	}
@@ -236,6 +245,10 @@ func isRequestScopedForbidden(upstreamCode, text string) bool {
 		"zero data retention", "zdr-blocked", "zdr blocked", "zdr-gated", "zdr gated",
 		"operation is unavailable under zdr", "operation unavailable under zdr",
 	)
+}
+
+func isDPoPProofRequired(upstreamCode string) bool {
+	return provider.IsDPoPProofRequiredText(upstreamCode)
 }
 
 func isDefinitiveAccountBlock(text string) bool {
