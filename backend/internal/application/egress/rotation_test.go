@@ -214,6 +214,32 @@ func TestRotateEgressLeaseRequiresConfiguration(t *testing.T) {
 	}
 }
 
+func TestRotateEgressLeaseAcceptsRawBracePlaceholder(t *testing.T) {
+	recorder := &resinCallRecorder{}
+	server := newResinTestServer(recorder)
+	defer server.Close()
+	proxyTemplate := "socks5h://US.{account}:token@" + strings.TrimPrefix(server.URL, "http://")
+	credentials := []accountdomain.Credential{
+		{ID: 6444, Provider: accountdomain.ProviderBuild, Enabled: true, EgressNodeID: 7},
+	}
+	service, _ := newRotationService(t, proxyTemplate, credentials, recorder, nil)
+	service.SetResinRotation(ResinRotationConfig{BaseURL: server.URL, AdminToken: "admin", Timeout: 10 * time.Second})
+	service.mu.Lock()
+	service.rotation.echo = func(context.Context, string) (string, error) { return "192.0.2.10", nil }
+	service.mu.Unlock()
+
+	result, err := service.RotateEgressLease(context.Background(), 7, "198.51.100.1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Changed {
+		t.Fatalf("raw brace template result = %+v", result)
+	}
+	if len(recorder.deleted) != 1 {
+		t.Fatalf("deleted leases = %v", recorder.deleted)
+	}
+}
+
 func TestParseEchoIPFormats(t *testing.T) {
 	if ip := parseEchoIP([]byte("fl=123\nh=1.1.1.1\nip=203.0.113.7\nts=1\n")); ip != "203.0.113.7" {
 		t.Fatalf("trace parse = %q", ip)

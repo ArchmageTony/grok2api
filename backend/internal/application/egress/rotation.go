@@ -178,11 +178,18 @@ func (s *Service) boundEgressIdentities(ctx context.Context, nodeID uint64) ([]s
 	return identities, nil
 }
 
+// parseResinURL 解析代理 URL; 存量数据可能保留未编码的 {account} 占位符,
+// 统一先编码再解析。
+func parseResinURL(proxyURL string) (*url.URL, error) {
+	cleaned := strings.NewReplacer("{account}", "%7Baccount%7D", "%7baccount%7d", "%7Baccount%7D").Replace(strings.TrimSpace(proxyURL))
+	return url.Parse(cleaned)
+}
+
 // parseResinTemplate 判定代理 URL 是否指向配置的 resin 实例, 并从用户名段
 // 拆出平台名与固定账号; 使用 {account} 占位符时固定账号为空。
 // 账号本身可能包含点号, 平台名按第一个点切分。
 func (r *resinRotator) parseResinTemplate(proxyURL string) (string, string, bool) {
-	parsed, err := url.Parse(strings.TrimSpace(proxyURL))
+	parsed, err := parseResinURL(proxyURL)
 	if err != nil || parsed.User == nil {
 		return "", "", false
 	}
@@ -206,7 +213,7 @@ func (r *resinRotator) parseResinTemplate(proxyURL string) (string, string, bool
 
 // renderProxyURL 把代理模板中的 {account} 占位符替换为指定身份。
 func (r *resinRotator) renderProxyURL(template, identity string) string {
-	parsed, err := url.Parse(template)
+	parsed, err := parseResinURL(template)
 	if err != nil || parsed.User == nil {
 		return template
 	}
