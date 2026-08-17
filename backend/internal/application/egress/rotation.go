@@ -15,6 +15,7 @@ import (
 	"time"
 
 	accountdomain "github.com/chenyme/grok2api/backend/internal/domain/account"
+	"github.com/chenyme/grok2api/backend/internal/repository"
 
 	_ "github.com/bdandy/go-socks4"
 	xproxy "golang.org/x/net/proxy"
@@ -96,6 +97,9 @@ func (s *Service) RotateEgressLease(ctx context.Context, nodeID uint64, oldExitI
 		return RotationResult{}, ErrRotationUnavailable
 	}
 	node, err := s.repository.GetEgressNode(ctx, nodeID)
+	if errors.Is(err, repository.ErrNotFound) {
+		return RotationResult{}, ErrNotFound
+	}
 	if err != nil {
 		return RotationResult{}, err
 	}
