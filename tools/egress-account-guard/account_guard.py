@@ -108,6 +108,18 @@ class Config:
         values = payload.get("config")
         if not isinstance(values, dict):
             raise ValueError("quality guard bootstrap config is missing")
+        # 管理页热保存的运行时策略覆盖 bootstrap 中的静态值, 与质量守护同口径。
+        runtime_path = BOOTSTRAP_FILE.with_name("runtime-config.json")
+        try:
+            with runtime_path.open("r", encoding="utf-8") as handle:
+                runtime = json.load(handle)
+            settings = runtime.get("settings") if isinstance(runtime, dict) else None
+            if isinstance(settings, dict):
+                for key in ("soft_tps", "hard_tps", "passive_poll_seconds"):
+                    if settings.get(key) is not None:
+                        values = {**values, key: settings[key]}
+        except (OSError, ValueError):
+            pass
         token = str(payload.get("internal_token") or "").strip()
         if not token:
             raise ValueError("bootstrap internal_token is missing")
@@ -413,7 +425,20 @@ class AccountGuard:
             entry.pop("forced_until", None)
             log_event("account_force_switch_restored", account_id=account_id, updated=updated)
 
+    def _reload_policy(self) -> None:
+        """每轮重新读取 bootstrap 与运行时策略, 跟随管理页热保存的阈值。"""
+        try:
+            fresh = Config.load()
+        except (ValueError, OSError) as exc:
+            log_event("policy_reload_failed", error=str(exc)[:200])
+            return
+        self.config.soft_tps = fresh.soft_tps
+        self.config.hard_tps = fresh.hard_tps
+        self.config.poll_seconds = fresh.poll_seconds
+        self.config.internal_token = fresh.internal_token
+
     def run_cycle(self) -> None:
+        self._reload_policy()
         now = time.time()
         self._restore_expired(now)
         for audit_value in self._fetch_new_audits():
