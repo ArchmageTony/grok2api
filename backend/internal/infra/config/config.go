@@ -245,26 +245,38 @@ type QualityGuardConfig struct {
 	Enabled bool `yaml:"enabled"`
 	// DeprecatedClientKeyID is accepted only so configurations created by the
 	// short-lived manual-ID preview continue to load. It is ignored.
-	DeprecatedClientKeyID   uint64   `yaml:"clientKeyID"`
-	Model                   string   `yaml:"model"`
-	NodeIDs                 []uint64 `yaml:"nodeIDs"`
-	Mode                    string   `yaml:"mode"`
-	ActiveInterval          Duration `yaml:"activeInterval"`
-	PassivePollInterval     Duration `yaml:"passivePollInterval"`
-	SoftTPS                 float64  `yaml:"softTPS"`
-	HardTPS                 float64  `yaml:"hardTPS"`
-	ConsecutiveSoft         int      `yaml:"consecutiveSoft"`
-	ConsecutiveErrors       int      `yaml:"consecutiveErrors"`
-	QuarantineDuration      Duration `yaml:"quarantineDuration"`
-	NoAccountBackoff        Duration `yaml:"noAccountBackoff"`
-	MinimumHealthyNodes     int      `yaml:"minimumHealthyNodes"`
-	MaxOutputTokens         int      `yaml:"maxOutputTokens"`
-	FailClosed              bool     `yaml:"failClosed"`
-	MinimumGenerationWindow Duration `yaml:"minimumGenerationWindow"`
-	RotationURL             string   `yaml:"rotationURL"`
-	RotationToken           string   `yaml:"rotationToken"`
-	RotationTimeout         Duration `yaml:"rotationTimeout"`
-	RotatableNodeIDs        []uint64 `yaml:"rotatableNodeIDs"`
+	DeprecatedClientKeyID   uint64                     `yaml:"clientKeyID"`
+	Model                   string                     `yaml:"model"`
+	NodeIDs                 []uint64                   `yaml:"nodeIDs"`
+	Mode                    string                     `yaml:"mode"`
+	ActiveInterval          Duration                   `yaml:"activeInterval"`
+	PassivePollInterval     Duration                   `yaml:"passivePollInterval"`
+	SoftTPS                 float64                    `yaml:"softTPS"`
+	HardTPS                 float64                    `yaml:"hardTPS"`
+	ConsecutiveSoft         int                        `yaml:"consecutiveSoft"`
+	ConsecutiveErrors       int                        `yaml:"consecutiveErrors"`
+	QuarantineDuration      Duration                   `yaml:"quarantineDuration"`
+	NoAccountBackoff        Duration                   `yaml:"noAccountBackoff"`
+	MinimumHealthyNodes     int                        `yaml:"minimumHealthyNodes"`
+	MaxOutputTokens         int                        `yaml:"maxOutputTokens"`
+	FailClosed              bool                       `yaml:"failClosed"`
+	MinimumGenerationWindow Duration                   `yaml:"minimumGenerationWindow"`
+	RotationURL             string                     `yaml:"rotationURL"`
+	RotationToken           string                     `yaml:"rotationToken"`
+	RotationTimeout         Duration                   `yaml:"rotationTimeout"`
+	RotatableNodeIDs        []uint64                   `yaml:"rotatableNodeIDs"`
+	Rotation                QualityGuardRotationConfig `yaml:"rotation"`
+}
+
+// QualityGuardRotationConfig 定义内建的 resin 租约轮换。启用后主程序直接处理
+// 质量守护的换 IP 请求, 通过内部 API 暴露, 不再需要外部 Webhook 容器。
+// 平台与账号从节点代理 URL 的用户名段 (platform.account) 实时解析。
+type QualityGuardRotationConfig struct {
+	Enabled         bool     `yaml:"enabled"`
+	ResinBaseURL    string   `yaml:"resinBaseURL"`
+	ResinAdminToken string   `yaml:"resinAdminToken"`
+	EchoURL         string   `yaml:"echoURL"`
+	Timeout         Duration `yaml:"timeout"`
 }
 
 type ClientKeyDefaultsConfig struct {
@@ -709,16 +721,34 @@ func validateQualityGuardConfig(value QualityGuardConfig) error {
 	if value.MinimumGenerationWindow.Value() < time.Millisecond || value.MinimumGenerationWindow.Value() > 2*time.Minute {
 		return errors.New("qualityGuard.minimumGenerationWindow 必须在 1 毫秒到 2 分钟之间")
 	}
-	if value.RotationTimeout.Value() < 5*time.Second || value.RotationTimeout.Value() > 5*time.Minute {
-		return errors.New("qualityGuard.rotationTimeout 必须在 5 秒到 5 分钟之间")
-	}
-	if len(value.RotatableNodeIDs) > 0 && strings.TrimSpace(value.RotationURL) == "" {
-		return errors.New("qualityGuard.rotatableNodeIDs 非空时必须配置 rotationURL")
+	if len(value.RotatableNodeIDs) > 0 && strings.TrimSpace(value.RotationURL) == "" && !value.Rotation.Enabled {
+		return errors.New("qualityGuard.rotatableNodeIDs 非空时必须配置 rotationURL 或启用 rotation")
 	}
 	if raw := strings.TrimSpace(value.RotationURL); raw != "" {
+		if value.RotationTimeout.Value() < 5*time.Second || value.RotationTimeout.Value() > 5*time.Minute {
+			return errors.New("qualityGuard.rotationTimeout 必须在 5 秒到 5 分钟之间")
+		}
 		parsed, err := url.ParseRequestURI(raw)
 		if err != nil || parsed.Host == "" || parsed.User != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") {
 			return errors.New("qualityGuard.rotationURL 必须是无凭据的 HTTP(S) URL")
+		}
+	}
+	if value.Rotation.Enabled {
+		parsed, err := url.ParseRequestURI(strings.TrimSpace(value.Rotation.ResinBaseURL))
+		if err != nil || parsed.Host == "" || parsed.User != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+			return errors.New("qualityGuard.rotation.resinBaseURL 必须是无凭据的 HTTP(S) URL")
+		}
+		if strings.TrimSpace(value.Rotation.ResinAdminToken) == "" {
+			return errors.New("qualityGuard.rotation.resinAdminToken 不能为空")
+		}
+		if value.Rotation.Timeout.Value() < 5*time.Second || value.Rotation.Timeout.Value() > 5*time.Minute {
+			return errors.New("qualityGuard.rotation.timeout 必须在 5 秒到 5 分钟之间")
+		}
+		if raw := strings.TrimSpace(value.Rotation.EchoURL); raw != "" {
+			echo, err := url.ParseRequestURI(raw)
+			if err != nil || echo.Host == "" || echo.User != nil || (echo.Scheme != "http" && echo.Scheme != "https") {
+				return errors.New("qualityGuard.rotation.echoURL 必须是无凭据的 HTTP(S) URL")
+			}
 		}
 	}
 	return nil

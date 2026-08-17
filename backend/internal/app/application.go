@@ -311,6 +311,14 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 	egressService.SetClearanceManager(egressManager)
 	egressService.SetNodeProber(egressManager)
 	egressService.SetOperationsConfigInvalidator(egressManager)
+	if cfg.QualityGuard.Enabled && cfg.QualityGuard.Rotation.Enabled {
+		egressService.SetResinRotation(egressapp.ResinRotationConfig{
+			BaseURL:    cfg.QualityGuard.Rotation.ResinBaseURL,
+			AdminToken: cfg.QualityGuard.Rotation.ResinAdminToken,
+			EchoURL:    cfg.QualityGuard.Rotation.EchoURL,
+			Timeout:    cfg.QualityGuard.Rotation.Timeout.Value(),
+		})
+	}
 	egressManager.SetFailureProber(egressService.TestNode)
 	clientKeyService := clientkeyapp.NewService(clientKeyRepo, rateLimiter, concurrency, cfg.ClientKeyDefaults.RPMLimit, cfg.ClientKeyDefaults.MaxConcurrent, cipher)
 	qualityGuardIdentity, err := clientKeyService.EnsureQualityGuardIdentity(ctx, cfg.QualityGuard.Enabled)

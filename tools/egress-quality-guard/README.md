@@ -74,11 +74,44 @@ suppresses quarantine. A short buffered burst is first retested on the same IP
 and is restored immediately when that one real-model probe is healthy, avoiding
 an unnecessary rotation for a measurement artifact.
 
-`qualityGuard.rotationURL` enables a trusted internal rotation webhook scoped
-by `qualityGuard.rotatableNodeIDs`. Confirmed suspect nodes are rotated, the
-exit-IP change is verified by the webhook, and one real-model quality probe must
-pass before restoration. The optional `session_rotator.py` implements this
-contract for 1024Proxy-style usernames containing `sid-...-t-...`.
+### Built-in Resin lease rotation
+
+`qualityGuard.rotation` lets the main server handle rotation directly, with no
+external webhook container:
+
+```yaml
+qualityGuard:
+  rotation:
+    enabled: true
+    resinBaseURL: "http://resin:2260"
+    resinAdminToken: "<resin admin token>"
+    echoURL: "https://1.1.1.1/cdn-cgi/trace"
+    timeout: 45s
+```
+
+Once an anomaly is confirmed, the guard calls the server's internal rotation
+endpoint. The server decrypts the node proxy configuration, releases the Resin
+leases of every bound Grok Build account, then measures the exit IP through the
+node's own proxy: a confirmed change restores the node after one quality probe,
+otherwise the node stays quarantined. Platform and account are resolved live
+from the proxy URL username (`platform.account` or the `platform.{account}`
+placeholder), so switching Resin platforms or replacing nodes requires no
+rotation configuration change. Direct-proxy nodes report as not rotatable; no
+`rotatableNodeIDs` list needs to be maintained.
+
+The rotation endpoint lives only on the quality-guard internal API and reuses
+the internal credential; the Resin admin token never leaves the server
+`config.yaml`.
+
+### External rotation webhook (compatibility path)
+
+Without `qualityGuard.rotation`, `qualityGuard.rotationURL` still enables a
+trusted internal rotation webhook scoped by `qualityGuard.rotatableNodeIDs`
+(an empty list now allows rotation attempts for every managed node). Confirmed
+suspect nodes are rotated, the exit-IP change is verified by the webhook, and
+one real-model quality probe must pass before restoration. The optional
+`session_rotator.py` implements this contract for 1024Proxy-style usernames
+containing `sid-...-t-...`.
 
 Probe failures require `qualityGuard.consecutiveErrors` consecutive attempts
 before quarantine. Account-selection failures are reported separately: if the
@@ -115,7 +148,7 @@ probe prompt, or model response body.
 - Uses an exclusive process lock to prevent duplicate guards.
 - Writes state atomically with mode `0600`.
 - Logs metrics and node metadata, never credentials, proxy URLs, or response text.
-- Uses a constant-time-checked internal credential scoped to six egress/audit routes.
+- Uses a constant-time-checked internal credential scoped to the egress, audit, and rotation routes the guard needs.
 
 ## Configuration
 

@@ -598,7 +598,9 @@ class Guard:
     def _should_rotate(self, node_id: str, reason: str) -> bool:
         return (
             bool(self.config.rotation_url)
-            and node_id in set(self.config.rotatable_node_ids)
+            # 内建 resin 轮换启用时 rotatableNodeIDs 留空, 表示全部纳管节点都允许
+            # 发起轮换; 节点是否支持换 IP 由轮换端点根据代理配置仲裁。
+            and (not self.config.rotatable_node_ids or node_id in set(self.config.rotatable_node_ids))
             and reason in {
                 "hard_tps", "soft_tps", "buffered_burst", "expected_marker_missing",
                 "insufficient_output_tokens", "insufficient_generation_window", "probe_errors",

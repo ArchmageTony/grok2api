@@ -16,6 +16,10 @@ import (
 
 const bootstrapVersion = 1
 
+// internalRotationURL 是主程序内建 resin 轮换的固定端点; 与 sidecar 的
+// base_url 约定 (http://grok2api:8000) 保持一致, 只在 Compose 内网可达。
+const internalRotationURL = "http://grok2api:8000/api/internal/v1/quality-guard/egress-rotation"
+
 const (
 	ProbePrompt   = "Write exactly 16 numbered lines about reliable distributed systems. Each line must be one complete English sentence, with no markdown heading. The final line must end with the exact marker QUALITY_OK."
 	ProbeExpected = "QUALITY_OK"
@@ -67,6 +71,16 @@ func Prepare(path string, value config.QualityGuardConfig, jwtSecret string) (st
 	if value.Enabled {
 		token = deriveToken(jwtSecret)
 	}
+	// 内建 resin 轮换启用时, 轮换端点固定为主程序内部 API, 凭据复用内部 token;
+	// 管理员配置的 rotationURL/rotationToken 不再生效。
+	rotationURL := strings.TrimSpace(value.RotationURL)
+	rotationToken := value.RotationToken
+	rotationTimeoutSeconds := int(value.RotationTimeout.Value().Seconds())
+	if value.Enabled && value.Rotation.Enabled {
+		rotationURL = internalRotationURL
+		rotationToken = token
+		rotationTimeoutSeconds = int(value.Rotation.Timeout.Value().Seconds())
+	}
 	payload := bootstrapFile{
 		Version: bootstrapVersion, Enabled: value.Enabled, InternalToken: token,
 		Config: bootstrapConfig{
@@ -77,8 +91,8 @@ func Prepare(path string, value config.QualityGuardConfig, jwtSecret string) (st
 			SoftTPS: value.SoftTPS, HardTPS: value.HardTPS, ConsecutiveSoft: value.ConsecutiveSoft, ConsecutiveErrors: value.ConsecutiveErrors,
 			QuarantineSeconds: int(value.QuarantineDuration.Value().Seconds()), NoAccountBackoffSeconds: int(value.NoAccountBackoff.Value().Seconds()),
 			MinHealthyNodes: value.MinimumHealthyNodes, MaxOutputTokens: value.MaxOutputTokens, FailClosed: value.FailClosed,
-			MinGenerationMS: int(value.MinimumGenerationWindow.Value().Milliseconds()), RotationURL: strings.TrimSpace(value.RotationURL),
-			RotationToken: value.RotationToken, RotationTimeoutSeconds: int(value.RotationTimeout.Value().Seconds()),
+			MinGenerationMS: int(value.MinimumGenerationWindow.Value().Milliseconds()), RotationURL: rotationURL,
+			RotationToken: rotationToken, RotationTimeoutSeconds: rotationTimeoutSeconds,
 			RotatableNodeIDs: uint64Strings(value.RotatableNodeIDs),
 		},
 	}

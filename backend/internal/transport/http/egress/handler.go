@@ -85,6 +85,41 @@ func (h *Handler) RegisterQualityGuard(router *gin.RouterGroup) {
 	router.POST("/egress-nodes/:id/test", h.testNode)
 	router.POST("/egress-nodes/:id/quality-test", h.testQualityGuardNode)
 	router.GET("/egress-operations", h.operationsConfig)
+	router.POST("/egress-rotation", h.rotateEgressLease)
+}
+
+// rotateEgressLease 实现质量守护的换 IP Webhook 契约: 成功返回
+// {"changed": true, "exitIp": ...}; 节点非 resin 托管或出口未变化时返回
+// {"changed": false, ...}; 未配置轮换时返回 503。
+func (h *Handler) rotateEgressLease(c *gin.Context) {
+	var request struct {
+		NodeID    string `json:"nodeId"`
+		OldExitIP string `json:"oldExitIp"`
+	}
+	decoder := json.NewDecoder(c.Request.Body)
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&request) != nil {
+		response.Error(c, http.StatusBadRequest, "invalidRequest", "请求参数无效")
+		return
+	}
+	nodeID, err := strconv.ParseUint(strings.TrimSpace(request.NodeID), 10, 64)
+	if err != nil || nodeID == 0 {
+		response.Error(c, http.StatusBadRequest, "invalidId", "ID 无效")
+		return
+	}
+	result, err := h.service.RotateEgressLease(c.Request.Context(), nodeID, request.OldExitIP)
+	if err != nil {
+		switch {
+		case errors.Is(err, egressapp.ErrRotationUnavailable):
+			response.Error(c, http.StatusServiceUnavailable, "egressRotationUnavailable", "质量守护轮换未配置")
+		case errors.Is(err, egressapp.ErrInvalidInput), errors.Is(err, egressapp.ErrNotFound):
+			h.writeError(c, err)
+		default:
+			response.Error(c, http.StatusBadGateway, "egressRotationFailed", "轮换执行失败")
+		}
+		return
+	}
+	c.JSON(http.StatusOK, result)
 }
 
 // A fully populated 2,000-node guard state is slightly larger than 1 MiB.

@@ -243,6 +243,33 @@ class GuardTests(unittest.TestCase):
             self.assertEqual(guard.state["statistics"]["actions"]["quarantined"], 1)
             self.assertEqual(guard.state["statistics"]["actions"]["restored"], 1)
 
+    def test_empty_rotatable_list_allows_rotation_for_any_managed_node(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cfg = config(
+                state_file=Path(directory) / "state.json",
+                lock_file=Path(directory) / "lock",
+                node_ids=("1",),
+                rotation_url="http://127.0.0.1:19099/rotate",
+                rotatable_node_ids=(),
+            )
+            guard = quality_guard.Guard(cfg, FakeApi(self.nodes(), []))
+            self.assertTrue(guard._should_rotate("1", "hard_tps"))
+            self.assertTrue(guard._should_rotate("2", "soft_tps"))
+            self.assertFalse(guard._should_rotate("1", "unlisted_reason"))
+
+    def test_explicit_rotatable_list_still_restricts_rotation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cfg = config(
+                state_file=Path(directory) / "state.json",
+                lock_file=Path(directory) / "lock",
+                node_ids=("1",),
+                rotation_url="http://127.0.0.1:19099/rotate",
+                rotatable_node_ids=("1",),
+            )
+            guard = quality_guard.Guard(cfg, FakeApi(self.nodes(), []))
+            self.assertTrue(guard._should_rotate("1", "hard_tps"))
+            self.assertFalse(guard._should_rotate("2", "hard_tps"))
+
     def test_auto_discovery_publishes_resolved_node_ids_for_status_consumers(self):
         with tempfile.TemporaryDirectory() as directory:
             cfg = config(state_file=Path(directory) / "state.json", lock_file=Path(directory) / "lock", mode="passive")

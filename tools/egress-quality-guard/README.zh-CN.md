@@ -42,8 +42,36 @@ Token/s，因此建议先观察 JSON 日志，再根据实际流量调整阈值�
 可疑样本都会先摘除节点，再进行确认；最低健康节点数不再阻止隔离。短生成窗口产生的
 瞬时高 TPS 会先在原 IP 上主动复测，复测正常即立即恢复，避免因为流式缓冲误换 IP。
 
-可通过 `qualityGuard.rotationURL` 接入受信任的内部换 IP Webhook，并用
-`qualityGuard.rotatableNodeIDs` 限制允许轮换的节点。确认异常后，守护程序会先调用
+### 内建 resin 租约轮换
+
+配置 `qualityGuard.rotation` 后，主程序直接处理换 IP，不再需要外部 Webhook 容器：
+
+```yaml
+qualityGuard:
+  rotation:
+    enabled: true
+    resinBaseURL: "http://resin:2260"
+    resinAdminToken: "<resin 管理令牌>"
+    echoURL: "https://1.1.1.1/cdn-cgi/trace"
+    timeout: 45s
+```
+
+确认异常后，守护程序调用主程序内部轮换端点；主程序解密节点代理配置，判定是否指向
+配置的 resin 实例，释放该节点全部已绑定 Build 账号的树脂租约，然后经节点自身代理
+实测出口 IP：确认变化返回已轮换并立即复测恢复，否则保持隔离。平台名与账号从代理
+URL 用户名段（`platform.account` 或 `platform.{account}` 占位符）实时解析，切换
+resin 平台或更换节点都不需要修改轮换配置。直连节点自动返回不可轮换，无需维护
+`rotatableNodeIDs` 名单。
+
+轮换端点只挂在质量守护内部 API 上，复用内部凭据认证，不在任何公开或管理接口暴露；
+resin 管理令牌只存在于主程序 `config.yaml`。轮换请求不携带代理凭据以外的额外信息，
+日志不记录 resin 令牌与代理地址。
+
+### 外部换 IP Webhook（兼容路径）
+
+未配置 `qualityGuard.rotation` 时，仍可通过 `qualityGuard.rotationURL` 接入受信任的
+外部换 IP Webhook，并用 `qualityGuard.rotatableNodeIDs` 限制允许轮换的节点；此时
+`rotatableNodeIDs` 留空表示全部纳管节点都允许发起轮换。确认异常后守护程序先调用
 Webhook，确认出口发生变化，再执行一次真实模型质量检测；检测正常立即恢复，否则保持
 隔离。Webhook 请求不包含代理凭据。
 
@@ -75,7 +103,7 @@ Webhook，确认出口发生变化，再执行一次真实模型质量检测；�
 - 使用进程锁防止重复运行。
 - 状态文件原子写入且权限为 `0600`。
 - 日志不记录管理员令牌、代理地址或模型回答正文。
-- 内部凭据使用常量时间比较，并且只允许访问六个质量守护所需的出口/审计路由。
+- 内部凭据使用常量时间比较，并且只允许访问质量守护所需的出口/审计/轮换路由。
 
 ## 配置与成本
 

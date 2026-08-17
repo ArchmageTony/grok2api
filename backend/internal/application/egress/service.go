@@ -109,6 +109,7 @@ type Service struct {
 	prober            NodeProber
 	operationsCache   OperationsConfigInvalidator
 	qualityProber     QualityProber
+	rotation          *resinRotator
 	assignmentMu      sync.Mutex
 	lastAssignmentRun time.Time
 	assignmentRunning bool

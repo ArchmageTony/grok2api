@@ -128,9 +128,18 @@ qualityGuard:
   maxOutputTokens: 384
   failClosed: false
   minimumGenerationWindow: 1s
-  # 可选的受信任换 IP Webhook；启用时同时填写 rotatableNodeIDs。
-  rotationURL: ""
-  rotationToken: ""
-  rotationTimeout: 45s
+  # [按需启用] 内建 resin 租约轮换。启用后确认异常的节点会释放其全部已绑定
+  # Build 账号的 resin 租约, 经节点自身代理实测出口 IP 变化后立即复测恢复。
+  # 平台与账号从节点代理 URL 的用户名段 (platform.account 或 platform.{account})
+  # 实时解析, 无需维护任何节点名单; 直连节点自动返回不可轮换。
+  rotation:
+    enabled: false
+    resinBaseURL: "http://resin:2260"
+    resinAdminToken: ""
+    # echo 端点用于轮换后实测出口 IP, 支持 Cloudflare trace 或 {"ip": ...} JSON。
+    echoURL: "https://1.1.1.1/cdn-cgi/trace"
+    timeout: 45s
   nodeIDs: []
-  rotatableNodeIDs: []
+  # 已废弃: rotationURL / rotationToken / rotatableNodeIDs。rotation.enabled 时
+  # 轮换端点固定为主程序内部 API; rotatableNodeIDs 留空表示全部纳管节点都允许
+  # 发起轮换, 能否轮换由主程序按节点代理配置仲裁。
