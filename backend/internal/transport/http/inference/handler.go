@@ -22,6 +22,8 @@ import (
 	clientkeydomain "github.com/chenyme/grok2api/backend/internal/domain/clientkey"
 	mediadomain "github.com/chenyme/grok2api/backend/internal/domain/media"
 	modeldomain "github.com/chenyme/grok2api/backend/internal/domain/model"
+	"github.com/chenyme/grok2api/backend/internal/infra/provider"
+	"github.com/chenyme/grok2api/backend/internal/pkg/mediafile"
 	"github.com/chenyme/grok2api/backend/internal/pkg/neterror"
 	"github.com/chenyme/grok2api/backend/internal/transport/http/middleware"
 	"github.com/gin-gonic/gin"
@@ -88,8 +90,20 @@ func (h *Handler) Register(router *gin.RouterGroup) {
 	router.POST("/images/generations", h.generateImage)
 	router.POST("/images/edits", h.editImage)
 	router.POST("/videos/generations", h.generateVideo)
+	router.POST("/videos/edits", h.editVideo)
+	router.POST("/videos/extensions", h.extendVideo)
 	router.GET("/videos/:requestId", h.getVideo)
 	router.GET("/videos/:requestId/content", h.getVideoContent)
+	router.POST("/tts", h.synthesizeSpeech)
+	router.GET("/tts/voices", h.listTTSVoices)
+	router.GET("/tts/voices/:voiceId", h.getTTSVoice)
+	router.POST("/stt", h.transcribeSpeech)
+	router.GET("/stt", h.proxySTTWebSocket)
+	// OpenAI-compatible audio aliases for common client SDKs.
+	router.POST("/audio/speech", h.synthesizeOpenAISpeech)
+	router.POST("/audio/tasks", h.synthesizeOpenAIAudioTask)
+	router.POST("/audio/transcriptions", h.transcribeOpenAIAudio)
+	router.GET("/realtime", h.proxyRealtimeWebSocket)
 	router.POST("/responses/compact", h.compactResponse)
 	router.GET("/responses/:responseId", h.getResponse)
 	router.DELETE("/responses/:responseId", h.deleteResponse)
@@ -124,6 +138,7 @@ type imageGenerationRequest struct {
 	Size           string          `json:"size"`
 	AspectRatio    string          `json:"aspect_ratio"`
 	Resolution     string          `json:"resolution"`
+	Quality        string          `json:"quality"`
 	ResponseFormat string          `json:"response_format"`
 	StorageOptions json.RawMessage `json:"storage_options"`
 	Stream         bool            `json:"stream"`
@@ -143,6 +158,7 @@ type imageEditJSONRequest struct {
 	Size           string               `json:"size"`
 	AspectRatio    string               `json:"aspect_ratio"`
 	Resolution     string               `json:"resolution"`
+	Quality        string               `json:"quality"`
 	ResponseFormat string               `json:"response_format"`
 	StorageOptions json.RawMessage      `json:"storage_options"`
 	Stream         bool                 `json:"stream"`
@@ -154,6 +170,10 @@ type videoGenerationImage struct {
 	FileID string `json:"file_id"`
 }
 
+type videoGenerationAudio struct {
+	VoiceID string `json:"voice_id"`
+}
+
 type videoGenerationRequest struct {
 	Model           string                 `json:"model"`
 	Prompt          string                 `json:"prompt"`
@@ -163,6 +183,8 @@ type videoGenerationRequest struct {
 	Resolution      string                 `json:"resolution"`
 	Image           *videoGenerationImage  `json:"image"`
 	ReferenceImages []videoGenerationImage `json:"reference_images"`
+	ReferenceAudios []videoGenerationAudio `json:"reference_audios"`
+	Video           *videoGenerationImage  `json:"video"`
 	Output          json.RawMessage        `json:"output"`
 	StorageOptions  json.RawMessage        `json:"storage_options"`
 }
@@ -392,6 +414,11 @@ func (h *Handler) generateImage(c *gin.Context) {
 			return
 		}
 	}
+	quality := strings.ToLower(strings.TrimSpace(request.Quality))
+	if quality != "" && quality != "low" && quality != "medium" {
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_parameter", "quality 必须是 low 或 medium")
+		return
+	}
 	clientKey, requestID, ok := requestIdentity(c)
 	if !ok {
 		return
@@ -399,7 +426,7 @@ func (h *Handler) generateImage(c *gin.Context) {
 	result, err := h.gateway.GenerateImage(c.Request.Context(), gateway.ImageGenerationInput{
 		RequestID: requestID, ClientKey: clientKey, PublicModel: request.Model, Prompt: request.Prompt,
 		Count: count, Size: request.Size, AspectRatio: request.AspectRatio,
-		Resolution: request.Resolution, ResponseFormat: request.ResponseFormat,
+		Resolution: request.Resolution, Quality: quality, ResponseFormat: request.ResponseFormat,
 		Streaming: request.Stream, PartialImages: partialImages,
 	})
 	if err != nil {
@@ -419,20 +446,30 @@ func (h *Handler) writeMediaResult(c *gin.Context, result *gateway.Result) {
 		writeOpenAIError(c, http.StatusServiceUnavailable, clientCode, credentialErrorMessage(clientCode))
 		return
 	}
+	if result.StatusCode < http.StatusOK || (result.StatusCode >= http.StatusMultipleChoices && result.StatusCode < http.StatusBadRequest) {
+		errorCode = "invalid_upstream_status"
+		writeOpenAIError(c, http.StatusBadGateway, "invalid_upstream_response", "上游媒体服务返回了不安全的重定向响应")
+		return
+	}
+	contentType, safeContentType := normalizeMediaResponseContentType(result.Header.Get("Content-Type"))
+	if !safeContentType {
+		errorCode = "unsafe_media_content_type"
+		writeOpenAIError(c, http.StatusBadGateway, "invalid_media_type", "上游媒体服务返回了不受支持的内容类型")
+		return
+	}
 	contentLength, contentLengthErr := strconv.ParseInt(result.Header.Get("Content-Length"), 10, 64)
 	if contentLengthErr == nil && contentLength > maxMediaResponseTransferBytes {
 		errorCode = "response_too_large"
 		writeOpenAIError(c, http.StatusBadGateway, "media_too_large", "上游媒体超过 2 GiB 安全上限")
 		return
 	}
-	copyHeaders(c.Writer.Header(), result.Header)
+	setSafeMediaResponseHeaders(c, result.Header)
 	if contentLengthErr == nil && contentLength >= 0 {
 		c.Header("Content-Length", strconv.FormatInt(contentLength, 10))
 	} else {
 		c.Header("Trailer", mediaTransferErrorTrailer)
 	}
-	c.Status(result.StatusCode)
-	if err := copyMedia(responseDeadlineWriter{ResponseWriter: c.Writer}, result.Body, maxMediaResponseTransferBytes); err != nil {
+	if err := writeMediaBody(c, result.Body, contentType, result.StatusCode, maxMediaResponseTransferBytes); err != nil {
 		if errors.Is(err, errResponseTransferLimit) {
 			errorCode = "response_too_large"
 		} else {
@@ -444,13 +481,39 @@ func (h *Handler) writeMediaResult(c *gin.Context, result *gateway.Result) {
 	}
 }
 
-type responseDeadlineWriter struct{ http.ResponseWriter }
-
-func (w responseDeadlineWriter) Write(payload []byte) (int, error) {
-	if err := setResponseWriteDeadline(w.ResponseWriter); err != nil {
-		return 0, err
+func normalizeMediaResponseContentType(value string) (string, bool) {
+	mediaType, _, err := mime.ParseMediaType(strings.TrimSpace(value))
+	if err != nil {
+		return "", false
 	}
-	return w.ResponseWriter.Write(payload)
+	mediaType = strings.ToLower(mediaType)
+	switch mediaType {
+	case "application/json":
+		return "application/json; charset=utf-8", true
+	case "text/plain":
+		return "text/plain; charset=utf-8", true
+	case "application/ogg":
+		return mediaType, true
+	}
+	if strings.HasPrefix(mediaType, "audio/") {
+		switch mediaType {
+		case "audio/aac", "audio/flac", "audio/l16", "audio/mpeg", "audio/mp3", "audio/ogg", "audio/opus", "audio/pcm", "audio/wav", "audio/webm", "audio/x-flac", "audio/x-wav":
+			return mediaType, true
+		}
+	}
+	return "", false
+}
+
+func setSafeMediaResponseHeaders(c *gin.Context, upstream http.Header) {
+	c.Header("Cache-Control", "private, no-store")
+	c.Header("X-Content-Type-Options", "nosniff")
+	c.Header("Content-Security-Policy", "default-src 'none'; sandbox")
+	c.Header("Referrer-Policy", "no-referrer")
+	for _, name := range []string{"Retry-After", "X-Request-Id"} {
+		if value := strings.TrimSpace(upstream.Get(name)); value != "" {
+			c.Header(name, value)
+		}
+	}
 }
 
 func setResponseWriteDeadline(writer http.ResponseWriter) error {
@@ -461,7 +524,11 @@ func setResponseWriteDeadline(writer http.ResponseWriter) error {
 	return err
 }
 
-func copyMedia(writer io.Writer, source io.Reader, limit int64) error {
+// writeMediaBody binds the validated non-HTML content type before emitting the
+// response body, so no caller can stream media bytes without their MIME context.
+func writeMediaBody(c *gin.Context, source io.Reader, contentType string, statusCode int, limit int64) error {
+	c.Header("Content-Type", contentType)
+	c.Status(statusCode)
 	buffer := make([]byte, 64<<10)
 	var transferred int64
 	for {
@@ -475,7 +542,10 @@ func copyMedia(writer io.Writer, source io.Reader, limit int64) error {
 			if int64(writeSize) > remaining {
 				writeSize = int(remaining)
 			}
-			written, writeErr := writer.Write(buffer[:writeSize])
+			if err := setResponseWriteDeadline(c.Writer); err != nil {
+				return err
+			}
+			written, writeErr := c.Writer.Write(buffer[:writeSize])
 			transferred += int64(written)
 			if writeErr != nil {
 				return writeErr
@@ -577,6 +647,11 @@ func (h *Handler) editImage(c *gin.Context) {
 		writeOpenAIError(c, http.StatusBadRequest, "invalid_parameter", "resolution 必须是 1k 或 2k")
 		return
 	}
+	quality := strings.ToLower(strings.TrimSpace(request.Quality))
+	if quality != "" && quality != "low" && quality != "medium" {
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_parameter", "quality 必须是 low 或 medium")
+		return
+	}
 	clientKey, requestID, ok := requestIdentity(c)
 	if !ok {
 		return
@@ -584,7 +659,7 @@ func (h *Handler) editImage(c *gin.Context) {
 	result, err := h.gateway.EditImage(c.Request.Context(), gateway.ImageEditInput{
 		RequestID: requestID, ClientKey: clientKey, PublicModel: model, Prompt: prompt,
 		ImageURLs: imageURLs, Count: count, Size: size, AspectRatio: aspectRatio,
-		Resolution: resolution, ResponseFormat: request.ResponseFormat,
+		Resolution: resolution, Quality: quality, ResponseFormat: request.ResponseFormat,
 		Streaming: request.Stream, PartialImages: partialImages,
 	})
 	if err != nil {
@@ -607,14 +682,32 @@ func requestIdentity(c *gin.Context) (clientkeydomain.Key, string, bool) {
 }
 
 func (h *Handler) generateVideo(c *gin.Context) {
+	h.handleVideoCreate(c, gatewayVideoOperationGenerate, "视频生成")
+}
+
+func (h *Handler) editVideo(c *gin.Context) {
+	h.handleVideoCreate(c, gatewayVideoOperationEdit, "视频编辑")
+}
+
+func (h *Handler) extendVideo(c *gin.Context) {
+	h.handleVideoCreate(c, gatewayVideoOperationExtend, "视频延长")
+}
+
+const (
+	gatewayVideoOperationGenerate = "generate"
+	gatewayVideoOperationEdit     = "edit"
+	gatewayVideoOperationExtend   = "extend"
+)
+
+func (h *Handler) handleVideoCreate(c *gin.Context, operation, label string) {
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, h.maxBodyBytes)
 	if !isJSONRequest(c) {
-		writeOpenAIError(c, http.StatusUnsupportedMediaType, "invalid_request", "视频生成仅支持 application/json")
+		writeOpenAIError(c, http.StatusUnsupportedMediaType, "invalid_request", label+"仅支持 application/json")
 		return
 	}
 	var request videoGenerationRequest
 	if err := decodeSingleJSON(c.Request.Body, &request, true); err != nil {
-		writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "视频生成 JSON 请求无效: "+err.Error())
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_request", label+" JSON 请求无效: "+err.Error())
 		return
 	}
 	if hasJSONValue(request.Output) {
@@ -625,71 +718,179 @@ func (h *Handler) generateVideo(c *gin.Context) {
 		writeOpenAIError(c, http.StatusBadRequest, "unsupported_parameter", "当前兼容层暂不支持 storage_options")
 		return
 	}
-	duration, err := parseVideoDuration(request.Duration)
-	if err != nil {
-		writeOpenAIError(c, http.StatusBadRequest, "invalid_request", err.Error())
-		return
-	}
 	model := strings.TrimSpace(request.Model)
 	prompt := strings.TrimSpace(request.Prompt)
 	if model == "" {
-		writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "视频生成缺少有效 model")
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_request", label+"缺少有效 model")
 		return
 	}
-	aspectRatio := strings.TrimSpace(request.AspectRatio)
-	if aspectRatio == "" {
-		aspectRatio = "16:9"
-	}
-	if !validVideoAspectRatio(aspectRatio) {
-		writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "aspect_ratio 必须是 1:1、16:9、9:16、4:3、3:4、3:2 或 2:3")
-		return
-	}
-	resolution := strings.ToLower(strings.TrimSpace(request.Resolution))
-	if resolution == "" {
-		resolution = "720p"
-	}
-	if resolution != "480p" && resolution != "720p" && resolution != "1080p" {
-		writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "resolution 必须是 480p、720p 或 1080p")
-		return
-	}
-	inputs := append([]videoGenerationImage(nil), request.ReferenceImages...)
-	if request.Image != nil {
-		inputs = append([]videoGenerationImage{*request.Image}, inputs...)
-	}
-	if len(inputs) > mediadomain.MaxInputImages {
-		writeOpenAIError(c, http.StatusBadRequest, "invalid_request", fmt.Sprintf("image 与 reference_images 合计不能超过 %d 张", mediadomain.MaxInputImages))
-		return
-	}
-	referenceURLs := make([]string, 0, len(inputs))
-	for _, input := range inputs {
+	parseVideoImage := func(input videoGenerationImage, field string) (string, bool) {
 		urlValue := strings.TrimSpace(input.URL)
 		fileID := strings.TrimSpace(input.FileID)
 		if (urlValue == "") == (fileID == "") {
-			writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "每个 image 必须且只能提供 url 或 file_id")
-			return
+			writeOpenAIError(c, http.StatusBadRequest, "invalid_request", field+" 必须且只能提供 url 或 file_id")
+			return "", false
 		}
 		if fileID != "" {
 			if !mediadomain.IsInputAssetID(fileID) {
-				writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "image.file_id 无效")
+				writeOpenAIError(c, http.StatusBadRequest, "invalid_request", field+".file_id 无效")
+				return "", false
+			}
+			return gateway.VideoInputFileReference(fileID), true
+		}
+		return urlValue, true
+	}
+
+	duration := 0
+	aspectRatio := ""
+	resolution := ""
+	imageURL := ""
+	referenceURLs := []string{}
+	referenceAudios := []string{}
+	videoURL := ""
+
+	if operation == gatewayVideoOperationGenerate {
+		var err error
+		duration, err = parseVideoDuration(request.Duration)
+		if err != nil {
+			writeOpenAIError(c, http.StatusBadRequest, "invalid_request", err.Error())
+			return
+		}
+		aspectRatio = strings.TrimSpace(request.AspectRatio)
+		if aspectRatio == "" {
+			aspectRatio = "16:9"
+		}
+		if !validVideoAspectRatio(aspectRatio) {
+			writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "aspect_ratio 必须是 1:1、16:9、9:16、4:3、3:4、3:2 或 2:3")
+			return
+		}
+		resolution = strings.ToLower(strings.TrimSpace(request.Resolution))
+		if resolution == "" {
+			resolution = "720p"
+		}
+		if resolution != "480p" && resolution != "720p" && resolution != "1080p" {
+			writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "resolution 必须是 480p、720p 或 1080p")
+			return
+		}
+		if request.Image != nil {
+			value, ok := parseVideoImage(*request.Image, "image")
+			if !ok {
 				return
 			}
-			referenceURLs = append(referenceURLs, gateway.VideoInputFileReference(fileID))
+			imageURL = value
+		}
+		referenceURLs = make([]string, 0, len(request.ReferenceImages))
+		for _, input := range request.ReferenceImages {
+			value, ok := parseVideoImage(input, "reference_images")
+			if !ok {
+				return
+			}
+			referenceURLs = append(referenceURLs, value)
+		}
+		referenceAudios = make([]string, 0, len(request.ReferenceAudios))
+		for i, input := range request.ReferenceAudios {
+			voiceID := strings.TrimSpace(input.VoiceID)
+			if voiceID == "" {
+				writeOpenAIError(c, http.StatusBadRequest, "invalid_request", fmt.Sprintf("reference_audios[%d].voice_id 不能为空", i))
+				return
+			}
+			referenceAudios = append(referenceAudios, voiceID)
+		}
+		if len(referenceAudios) > 3 {
+			writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "reference_audios 最多 3 个")
+			return
+		}
+		if imageURL != "" && (len(referenceURLs) > 0 || len(referenceAudios) > 0) {
+			writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "image 不能与 reference_images/reference_audios 同时使用")
+			return
+		}
+		if len(referenceURLs) > mediadomain.MaxInputImages {
+			writeOpenAIError(c, http.StatusBadRequest, "invalid_request", fmt.Sprintf("reference_images 不能超过 %d 张", mediadomain.MaxInputImages))
+			return
+		}
+		hasReferenceMode := len(referenceURLs) > 0 || len(referenceAudios) > 0
+		if hasReferenceMode {
+			if prompt == "" {
+				writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "参考图/参考音频视频必须提供 prompt")
+				return
+			}
+			if resolution == "1080p" {
+				writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "参考图视频 resolution 最高 720p")
+				return
+			}
+		}
+		if prompt == "" && imageURL == "" && !hasReferenceMode {
+			writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "文本生视频必须提供 prompt；图片生视频可以省略 prompt")
+			return
+		}
+		if request.Video != nil {
+			writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "视频生成不支持 video 输入")
+			return
+		}
+	} else {
+		if prompt == "" {
+			writeOpenAIError(c, http.StatusBadRequest, "invalid_request", label+"必须提供 prompt")
+			return
+		}
+		if request.Video == nil {
+			writeOpenAIError(c, http.StatusBadRequest, "invalid_request", label+"必须提供 video")
+			return
+		}
+		value, ok := parseVideoImage(*request.Video, "video")
+		if !ok {
+			return
+		}
+		videoURL = value
+		if request.Image != nil || len(request.ReferenceImages) > 0 || len(request.ReferenceAudios) > 0 {
+			writeOpenAIError(c, http.StatusBadRequest, "invalid_request", label+"不支持 image、reference_images 或 reference_audios")
+			return
+		}
+		if strings.TrimSpace(request.AspectRatio) != "" || strings.TrimSpace(request.Resolution) != "" {
+			writeOpenAIError(c, http.StatusBadRequest, "invalid_request", label+"不支持 aspect_ratio 或 resolution")
+			return
+		}
+		if operation == gatewayVideoOperationEdit {
+			if hasJSONValue(request.Duration) {
+				writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "视频编辑不支持 duration")
+				return
+			}
 		} else {
-			referenceURLs = append(referenceURLs, urlValue)
+			// extend: duration optional, default 6, range 2-10
+			if hasJSONValue(request.Duration) {
+				var err error
+				duration, err = parseVideoDuration(request.Duration)
+				if err != nil {
+					writeOpenAIError(c, http.StatusBadRequest, "invalid_request", err.Error())
+					return
+				}
+			} else {
+				duration = 6
+			}
+			if duration < 2 || duration > 10 {
+				writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "视频延长 duration 必须在 2 到 10 秒之间")
+				return
+			}
 		}
 	}
-	if prompt == "" && len(referenceURLs) == 0 {
-		writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "文本生视频必须提供 prompt；图片生视频可以省略 prompt")
-		return
-	}
+
 	clientKey, requestID, ok := requestIdentity(c)
 	if !ok {
 		return
 	}
+	var op provider.VideoOperation
+	switch operation {
+	case gatewayVideoOperationEdit:
+		op = provider.VideoOperationEdit
+	case gatewayVideoOperationExtend:
+		op = provider.VideoOperationExtend
+	default:
+		op = provider.VideoOperationGenerate
+	}
 	job, err := h.gateway.CreateVideo(c.Request.Context(), gateway.VideoInput{
 		RequestID: requestID, ClientKey: clientKey, PublicModel: model,
-		Prompt: prompt, Duration: duration, AspectRatio: aspectRatio, Resolution: resolution,
-		ReferenceURLs: referenceURLs,
+		Operation: op,
+		Prompt:    prompt, Duration: duration, AspectRatio: aspectRatio, Resolution: resolution,
+		ImageURL: imageURL, ReferenceURLs: referenceURLs, ReferenceAudios: referenceAudios, VideoURL: videoURL,
 	})
 	if err != nil {
 		writeGatewayError(c, err)
@@ -708,11 +909,10 @@ func (h *Handler) getVideo(c *gin.Context) {
 		writeGatewayError(c, err)
 		return
 	}
-	c.JSON(http.StatusOK, videoGenerationResponse(job, h.videoContentURL(job.ID)))
+	c.JSON(http.StatusOK, videoGenerationResponse(job, h.videoPlaybackURL(job)))
 }
 
-func (h *Handler) videoContentURL(jobID string) string {
-	path := "/v1/videos/" + url.PathEscape(jobID) + "/content"
+func (h *Handler) publicURL(path string) string {
 	baseURL := h.publicAPIBaseURL
 	if h.publicBaseURL != nil {
 		baseURL = strings.TrimRight(strings.TrimSpace(h.publicBaseURL()), "/")
@@ -721,6 +921,22 @@ func (h *Handler) videoContentURL(jobID string) string {
 		return path
 	}
 	return baseURL + path
+}
+
+func (h *Handler) videoContentURL(jobID string) string {
+	return h.publicURL("/v1/videos/" + url.PathEscape(jobID) + "/content")
+}
+
+// videoPlaybackURL prefers the stored asset served by the public media route, so the
+// returned link opens directly in browsers and players. /v1/videos/{id}/content needs
+// the client API key, which makes the URL unusable outside an authenticated client.
+// Images already return their public media URL; this keeps video consistent. Jobs
+// without a stored asset keep the protected content endpoint.
+func (h *Handler) videoPlaybackURL(job mediadomain.Job) string {
+	if assetID := strings.TrimSpace(job.ResultAssetID); assetID != "" {
+		return h.publicURL("/v1/media/videos/" + url.PathEscape(assetID))
+	}
+	return h.videoContentURL(job.ID)
 }
 
 func (h *Handler) getVideoContent(c *gin.Context) {
@@ -734,30 +950,49 @@ func (h *Handler) getVideoContent(c *gin.Context) {
 		return
 	}
 	defer func() { _ = body.Close() }()
-	writeVideoContent(c, body, contentType, size)
+	writeVideoContent(c, body, contentType, size, strings.TrimSpace(c.Param("requestId")))
 }
 
-func writeVideoContent(c *gin.Context, body io.Reader, contentType string, size int64) {
+func writeVideoContent(c *gin.Context, body io.Reader, contentType string, size int64, downloadName string) {
 	if size > maxMediaResponseTransferBytes {
 		writeOpenAIError(c, http.StatusBadGateway, "media_too_large", "上游媒体超过 2 GiB 安全上限")
 		return
 	}
-	c.Header("Content-Type", contentType)
-	c.Header("Content-Disposition", "inline")
+	contentType, ok := normalizeVideoResponseContentType(contentType)
+	if !ok {
+		writeOpenAIError(c, http.StatusBadGateway, "invalid_media_type", "上游视频服务返回了不受支持的内容类型")
+		return
+	}
+	// Clients that save the response need an extension to get a playable file.
+	c.Header("Content-Disposition", mediafile.VideoContentDisposition(downloadName, contentType))
 	c.Header("Cache-Control", "private, no-store")
 	c.Header("X-Content-Type-Options", "nosniff")
+	c.Header("Content-Security-Policy", "default-src 'none'; sandbox")
+	c.Header("Referrer-Policy", "no-referrer")
 	if size >= 0 {
 		c.Header("Content-Length", strconv.FormatInt(size, 10))
 	} else {
 		c.Header("Trailer", mediaTransferErrorTrailer)
 	}
-	c.Status(http.StatusOK)
-	if err := copyMedia(responseDeadlineWriter{ResponseWriter: c.Writer}, body, maxMediaResponseTransferBytes); err != nil && size < 0 {
+	if err := writeMediaBody(c, body, contentType, http.StatusOK, maxMediaResponseTransferBytes); err != nil && size < 0 {
 		errorCode := "stream_interrupted"
 		if errors.Is(err, errResponseTransferLimit) {
 			errorCode = "response_too_large"
 		}
 		c.Header(mediaTransferErrorTrailer, errorCode)
+	}
+}
+
+func normalizeVideoResponseContentType(value string) (string, bool) {
+	mediaType, _, err := mime.ParseMediaType(strings.TrimSpace(value))
+	if err != nil {
+		return "", false
+	}
+	switch strings.ToLower(mediaType) {
+	case "video/mp4", "video/quicktime", "video/webm":
+		return strings.ToLower(mediaType), true
+	default:
+		return "", false
 	}
 }
 
@@ -834,9 +1069,17 @@ func videoGenerationResponse(job mediadomain.Job, contentURLs ...string) gin.H {
 		if len(contentURLs) > 0 && contentURLs[0] != "" {
 			videoURL = contentURLs[0]
 		}
+		video := gin.H{"url": videoURL, "respect_moderation": true}
+		operation := job.Operation
+		if operation == "" {
+			operation = mediadomain.VideoOperationGenerate
+		}
+		if operation == mediadomain.VideoOperationGenerate && job.Seconds > 0 {
+			video["duration"] = job.Seconds
+		}
 		return gin.H{
 			"status": "done", "model": job.Model, "progress": 100,
-			"video": gin.H{"url": videoURL, "duration": job.Seconds, "respect_moderation": true},
+			"video": video,
 		}
 	case mediadomain.StatusFailed:
 		return gin.H{
@@ -1044,27 +1287,45 @@ type responseMetadata struct {
 
 func copyStream(writer gin.ResponseWriter, source io.Reader, protocol streamProtocol, onFirstToken func()) (responseMetadata, error) {
 	inspector := &responseInspector{protocol: protocol, onFirstToken: onFirstToken}
+	markerFilter := internalSSEMarkerFilter{enabled: protocol == streamProtocolChat}
 	buffer := make([]byte, responseCopyBufferBytes)
 	transferred := 0
 	for {
 		n, readErr := source.Read(buffer)
 		if n > 0 {
-			if transferred+n > maxStreamResponseTransferBytes {
-				return inspector.Metadata(), fmt.Errorf("%w: 流式响应超过 %d MiB", errResponseTransferLimit, maxStreamResponseTransferBytes>>20)
-			}
 			chunk := buffer[:n]
 			inspector.Inspect(chunk)
-			if err := setResponseWriteDeadline(writer); err != nil {
-				return inspector.Metadata(), err
+			chunk = markerFilter.Filter(chunk, false)
+			if transferred+len(chunk) > maxStreamResponseTransferBytes {
+				return inspector.Metadata(), fmt.Errorf("%w: 流式响应超过 %d MiB", errResponseTransferLimit, maxStreamResponseTransferBytes>>20)
 			}
-			if _, err := writer.Write(chunk); err != nil {
-				return inspector.Metadata(), err
+			if len(chunk) > 0 {
+				if err := setResponseWriteDeadline(writer); err != nil {
+					return inspector.Metadata(), err
+				}
+				if _, err := writer.Write(chunk); err != nil {
+					return inspector.Metadata(), err
+				}
+				writer.Flush()
+				transferred += len(chunk)
 			}
-			writer.Flush()
 			inspector.markFirstTokenForwarded()
-			transferred += n
 		}
 		if readErr != nil {
+			if tail := markerFilter.Filter(nil, true); len(tail) > 0 {
+				if transferred+len(tail) > maxStreamResponseTransferBytes {
+					return inspector.Metadata(), fmt.Errorf("%w: 流式响应超过 %d MiB", errResponseTransferLimit, maxStreamResponseTransferBytes>>20)
+				}
+				if err := setResponseWriteDeadline(writer); err != nil {
+					return inspector.Metadata(), err
+				}
+				if _, err := writer.Write(tail); err != nil {
+					return inspector.Metadata(), err
+				}
+				writer.Flush()
+				transferred += len(tail)
+			}
+			inspector.markFirstTokenForwarded()
 			if errors.Is(readErr, io.EOF) {
 				inspector.Finish()
 				return inspector.Metadata(), inspector.TerminalError()
@@ -1074,6 +1335,43 @@ func copyStream(writer gin.ResponseWriter, source io.Reader, protocol streamProt
 			}
 			return inspector.Metadata(), fmt.Errorf("%w: %w", errUpstreamStreamRead, readErr)
 		}
+	}
+}
+
+type internalSSEMarkerFilter struct {
+	enabled bool
+	pending []byte
+}
+
+func (f *internalSSEMarkerFilter) Filter(chunk []byte, final bool) []byte {
+	if !f.enabled {
+		return chunk
+	}
+	marker := []byte(reasoningStartSSEComment + "\n\n")
+	f.pending = append(f.pending, chunk...)
+	result := make([]byte, 0, len(f.pending))
+	for {
+		if index := bytes.Index(f.pending, marker); index >= 0 {
+			result = append(result, f.pending[:index]...)
+			f.pending = f.pending[index+len(marker):]
+			continue
+		}
+		if final {
+			result = append(result, f.pending...)
+			f.pending = nil
+			return result
+		}
+		keep := 0
+		limit := min(len(f.pending), len(marker)-1)
+		for size := limit; size > 0; size-- {
+			if bytes.Equal(f.pending[len(f.pending)-size:], marker[:size]) {
+				keep = size
+				break
+			}
+		}
+		result = append(result, f.pending[:len(f.pending)-keep]...)
+		f.pending = f.pending[len(f.pending)-keep:]
+		return result
 	}
 }
 
@@ -1128,6 +1426,8 @@ type responseInspector struct {
 	terminalFailure bool
 }
 
+const reasoningStartSSEComment = ": grok2api-reasoning-start"
+
 func (i *responseInspector) Inspect(chunk []byte) {
 	i.pending = append(i.pending, chunk...)
 	for {
@@ -1140,13 +1440,17 @@ func (i *responseInspector) Inspect(chunk []byte) {
 		}
 		line := bytes.TrimSpace(i.pending[:index])
 		i.pending = i.pending[index+1:]
+		if i.protocol == streamProtocolChat && bytes.Equal(line, []byte(reasoningStartSSEComment)) {
+			i.observeReasoningStart()
+			continue
+		}
 		if bytes.HasPrefix(line, []byte("data:")) {
 			value := bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:")))
 			i.observeFirstToken(value)
 			i.observeTerminal(value)
 			if !bytes.Equal(value, []byte("[DONE]")) {
 				metadata := extractMetadata(value)
-				if hasUsageSignal(metadata.Usage) {
+				if hasUsageMetadata(metadata.Usage) {
 					if metadata.Usage.ResponseModel == "" {
 						metadata.Usage.ResponseModel = i.metadata.Model
 					}
@@ -1165,6 +1469,13 @@ func (i *responseInspector) Inspect(chunk []byte) {
 			}
 		}
 	}
+}
+
+func (i *responseInspector) observeReasoningStart() {
+	if i.firstTokenSeen || i.firstTokenReady || i.onFirstToken == nil {
+		return
+	}
+	i.firstTokenReady = true
 }
 
 func (i *responseInspector) observeFirstToken(data []byte) {
@@ -1193,13 +1504,23 @@ func containsGeneratedDelta(data []byte, protocol streamProtocol) bool {
 		var event struct {
 			Type  string `json:"type"`
 			Delta string `json:"delta"`
+			Item  struct {
+				ID   string `json:"id"`
+				Type string `json:"type"`
+			} `json:"item"`
 		}
-		if json.Unmarshal(data, &event) != nil || event.Delta == "" {
+		if json.Unmarshal(data, &event) != nil {
 			return false
 		}
 		switch event.Type {
 		case "response.output_text.delta", "response.reasoning_summary_text.delta", "response.reasoning_text.delta", "response.refusal.delta", "response.function_call_arguments.delta", "response.custom_tool_call_input.delta":
-			return true
+			return event.Delta != ""
+		case "response.output_item.added":
+			// Native Responses can stream an identified reasoning item with no
+			// text delta when only encrypted_content is requested. That item is
+			// still generation start; waiting for output_text kicks thinking
+			// time out of the TPS denominator.
+			return event.Item.Type == "reasoning" && event.Item.ID != ""
 		}
 	case streamProtocolChat:
 		var event struct {
@@ -1208,6 +1529,7 @@ func containsGeneratedDelta(data []byte, protocol streamProtocol) bool {
 					Content          string `json:"content"`
 					Reasoning        string `json:"reasoning"`
 					ReasoningContent string `json:"reasoning_content"`
+					ThinkingContent  string `json:"thinking_content"`
 					Refusal          string `json:"refusal"`
 					ToolCalls        []struct {
 						Function struct {
@@ -1222,7 +1544,7 @@ func containsGeneratedDelta(data []byte, protocol streamProtocol) bool {
 		}
 		for _, choice := range event.Choices {
 			delta := choice.Delta
-			if delta.Content != "" || delta.Reasoning != "" || delta.ReasoningContent != "" || delta.Refusal != "" {
+			if delta.Content != "" || delta.Reasoning != "" || delta.ReasoningContent != "" || delta.ThinkingContent != "" || delta.Refusal != "" {
 				return true
 			}
 			for _, call := range delta.ToolCalls {
@@ -1233,7 +1555,10 @@ func containsGeneratedDelta(data []byte, protocol streamProtocol) bool {
 		}
 	case streamProtocolAnthropic:
 		var event struct {
-			Type  string `json:"type"`
+			Type         string `json:"type"`
+			ContentBlock struct {
+				Type string `json:"type"`
+			} `json:"content_block"`
 			Delta struct {
 				Type        string `json:"type"`
 				Text        string `json:"text"`
@@ -1241,7 +1566,13 @@ func containsGeneratedDelta(data []byte, protocol streamProtocol) bool {
 				PartialJSON string `json:"partial_json"`
 			} `json:"delta"`
 		}
-		if json.Unmarshal(data, &event) != nil || event.Type != "content_block_delta" {
+		if json.Unmarshal(data, &event) != nil {
+			return false
+		}
+		if event.Type == "content_block_start" {
+			return event.ContentBlock.Type == "thinking"
+		}
+		if event.Type != "content_block_delta" {
 			return false
 		}
 		switch event.Delta.Type {
@@ -1558,6 +1889,7 @@ func (value responseUsageDTO) toGatewayUsage(responseModel string) gateway.Usage
 		reasoning = value.OutputTokensDetails.ThinkingTokens
 	}
 	return gateway.Usage{
+		Reported:    true,
 		InputTokens: input, CachedInputTokens: cached,
 		OutputTokens: output, ReasoningTokens: reasoning,
 		TotalTokens: total, CostInUSDTicks: value.CostInUSDTicks,
@@ -1567,8 +1899,8 @@ func (value responseUsageDTO) toGatewayUsage(responseModel string) gateway.Usage
 	}
 }
 
-func hasUsageSignal(usage gateway.Usage) bool {
-	return usage.InputTokens > 0 || usage.OutputTokens > 0 || usage.TotalTokens > 0 ||
+func hasUsageMetadata(usage gateway.Usage) bool {
+	return usage.Reported || usage.InputTokens > 0 || usage.OutputTokens > 0 || usage.TotalTokens > 0 ||
 		usage.CachedInputTokens > 0 || usage.ReasoningTokens > 0 || usage.CostInUSDTicks > 0 ||
 		usage.NumSourcesUsed > 0 || usage.NumServerSideToolsUsed > 0 ||
 		usage.ContextInputTokens > 0 || usage.ContextOutputTokens > 0
@@ -1577,6 +1909,7 @@ func hasUsageSignal(usage gateway.Usage) bool {
 // mergeGatewayUsage merges usage from multiple streaming frames; non-zero fields overwrite,
 // preventing a later partial frame from erasing an already parsed cache hit.
 func mergeGatewayUsage(base, next gateway.Usage) gateway.Usage {
+	base.Reported = base.Reported || next.Reported
 	if next.InputTokens > 0 {
 		base.InputTokens = next.InputTokens
 	}
@@ -1684,8 +2017,11 @@ func writeGatewayError(c *gin.Context, err error) {
 	case errors.Is(err, gateway.ErrResponseStateUnsupported), errors.Is(err, gateway.ErrConversationUnsupported):
 		status, code = http.StatusBadRequest, "unsupported_parameter"
 		message = err.Error()
-	case errors.Is(err, gateway.ErrVideoInputTooLarge), errors.Is(err, gateway.ErrVideoInputUnavailable):
+	case errors.Is(err, gateway.ErrVideoInputTooLarge), errors.Is(err, gateway.ErrVideoInputUnavailable), errors.Is(err, gateway.ErrVideoParameterInvalid):
 		status, code = http.StatusBadRequest, "invalid_request"
+		message = err.Error()
+	case errors.Is(err, gateway.ErrVideoOperationUnsupported):
+		status, code = http.StatusBadRequest, "unsupported_model"
 		message = err.Error()
 	case errors.As(err, &upstreamFailure):
 		if isSanitizedUpstreamAvailabilityFailure(upstreamFailure) {

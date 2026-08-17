@@ -12,15 +12,16 @@ import (
 )
 
 type candidateScore struct {
-	index           int
-	tier            int
-	preferFreeBuild bool
-	quotaKnown      bool
-	quotaAvailable  bool
-	billingFresh    bool
-	inFlight        int
-	remaining       float64
-	lastSelected    time.Time
+	index             int
+	webCatalogSupport bool
+	tier              int
+	preferFreeBuild   bool
+	quotaKnown        bool
+	quotaAvailable    bool
+	billingFresh      bool
+	inFlight          int
+	remaining         float64
+	lastSelected      time.Time
 }
 
 // candidatePlan 使用线性建堆保留完整路由优先级，并允许 claim 失败后按顺序取下一账号。
@@ -61,11 +62,19 @@ func (p *candidatePlan) Next() (account.RoutingCandidate, bool) {
 func candidateScoreBetter(values []account.RoutingCandidate, leftScore, rightScore candidateScore) bool {
 	leftCandidate, rightCandidate := values[leftScore.index], values[rightScore.index]
 	left, right := leftCandidate.Credential, rightCandidate.Credential
-	if leftCandidate.SupportsModel != rightCandidate.SupportsModel {
-		return leftCandidate.SupportsModel
+	leftSupports, rightSupports := leftCandidate.SupportsModel, rightCandidate.SupportsModel
+	leftKnown, rightKnown := leftCandidate.ModelCapabilityKnown, rightCandidate.ModelCapabilityKnown
+	if leftScore.webCatalogSupport {
+		leftSupports, leftKnown = true, true
 	}
-	if leftCandidate.ModelCapabilityKnown != rightCandidate.ModelCapabilityKnown {
-		return leftCandidate.ModelCapabilityKnown
+	if rightScore.webCatalogSupport {
+		rightSupports, rightKnown = true, true
+	}
+	if leftSupports != rightSupports {
+		return leftSupports
+	}
+	if leftKnown != rightKnown {
+		return leftKnown
 	}
 	// A synced remote window with remaining quota is a stronger routing signal
 	// than priority or tier. Unknown windows remain eligible as a fallback, but
@@ -111,7 +120,7 @@ func (s *Selector) planCandidateIndexes(ctx context.Context, values []account.Ro
 	return s.planCandidateIndexesWithHints(ctx, values, indexes, now, tierOrder, nil, s.preferFreeBuildEnabled())
 }
 
-func (s *Selector) planCandidateIndexesWithHints(ctx context.Context, values []account.RoutingCandidate, indexes []int, now time.Time, tierOrder []account.WebTier, concurrencyHints []int, preferFreeBuild bool) (*candidatePlan, error) {
+func (s *Selector) planCandidateIndexesWithHints(ctx context.Context, values []account.RoutingCandidate, indexes []int, now time.Time, tierOrder []account.WebTier, concurrencyHints map[int]int, preferFreeBuild bool) (*candidatePlan, error) {
 	length := len(indexes)
 	if indexes == nil {
 		length = len(values)
@@ -141,7 +150,7 @@ func (s *Selector) planCandidateIndexesWithHints(ctx context.Context, values []a
 			if indexes != nil {
 				index = indexes[position]
 			}
-			if concurrencyHints[index] != 0 {
+			if _, exists := concurrencyHints[index]; exists {
 				continue
 			}
 			missingIndexes = append(missingIndexes, index)
@@ -153,7 +162,7 @@ func (s *Selector) planCandidateIndexesWithHints(ctx context.Context, values []a
 				return nil, err
 			}
 			for position, index := range missingIndexes {
-				concurrencyHints[index] = concurrencySnapshot[keys[position]] + 1
+				concurrencyHints[index] = concurrencySnapshot[keys[position]]
 			}
 		}
 		for position := range length {
@@ -161,7 +170,7 @@ func (s *Selector) planCandidateIndexesWithHints(ctx context.Context, values []a
 			if indexes != nil {
 				index = indexes[position]
 			}
-			inFlight[position] = concurrencyHints[index] - 1
+			inFlight[position] = concurrencyHints[index]
 		}
 	}
 
@@ -184,8 +193,9 @@ func (s *Selector) planCandidateIndexesWithHints(ctx context.Context, values []a
 		}
 		score := candidateScore{
 			index: index, tier: tierOrderRank(tierOrder, candidate.Credential.WebTier),
-			preferFreeBuild: preferFreeBuild && candidate.IsKnownFreeBuild(),
-			inFlight:        inFlight[position], lastSelected: s.lastSelectedAt[candidate.Credential.ID],
+			webCatalogSupport: candidate.Credential.Provider == account.ProviderWeb && len(tierOrder) > 0 && webTierInOrder(tierOrder, candidate.Credential.WebTier),
+			preferFreeBuild:   preferFreeBuild && candidate.IsKnownFreeBuild(),
+			inFlight:          inFlight[position], lastSelected: s.lastSelectedAt[candidate.Credential.ID],
 		}
 		// 只有真实上游快照能够证明账号具备该模式额度。历史默认值和
 		// 本地预测值都属于未知能力，只保留为路由兜底。
@@ -210,21 +220,20 @@ func (s *Selector) planCandidateIndexesWithHints(ctx context.Context, values []a
 func (s *Selector) loadConcurrencySnapshot(ctx context.Context, keys []string) (map[string]int, error) {
 	cacheKey := concurrencySnapshotKey(keys)
 	load := func() (map[string]int, error) {
-		values := make(map[string]int, len(keys))
 		if batchReader, ok := s.concurrency.(repository.ConcurrencySnapshotReader); ok {
-			var err error
-			values, err = batchReader.CurrentMany(ctx, keys)
+			values, err := batchReader.CurrentMany(ctx, keys)
 			if err != nil {
 				return nil, fmt.Errorf("批量读取账号并发租约: %w", err)
 			}
-		} else {
-			for _, key := range keys {
-				current, err := s.concurrency.Current(ctx, key)
-				if err != nil {
-					return nil, fmt.Errorf("读取账号并发租约: %w", err)
-				}
-				values[key] = current
+			return values, nil
+		}
+		values := make(map[string]int, len(keys))
+		for _, key := range keys {
+			current, err := s.concurrency.Current(ctx, key)
+			if err != nil {
+				return nil, fmt.Errorf("读取账号并发租约: %w", err)
 			}
+			values[key] = current
 		}
 		return values, nil
 	}

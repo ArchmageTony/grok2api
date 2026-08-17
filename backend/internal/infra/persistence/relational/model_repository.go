@@ -23,6 +23,8 @@ type ModelRepository struct {
 	observer repository.InvalidationObserver
 }
 
+const retiredWebImageQualityLitePublicID = "Web/grok-imagine-image-quality-lite"
+
 // Console static support is anchored to the reconciled catalog routes instead
 // of the provider name alone. Manual aliases remain supported while an
 // equivalent catalog route exists, and stale aliases stop advertising support
@@ -49,6 +51,36 @@ const modelConsoleStaticSupportAvailabilityExpression = `(route.provider = 'grok
 	)
 ))`
 
+// These Web media catalog capabilities are available to Basic accounts for
+// their confirmed quota products. Older capability snapshots may predate that
+// support, so catalog routes (and their aliases) remain discoverable while the
+// runtime selector enforces the adapter's parameter-specific tier order.
+const modelWebBasicMediaStaticSupportExpression = `(model_routes.provider = 'grok_web'
+	AND model_routes.upstream_model IN ('grok-imagine-image-quality', 'grok-imagine-image-2.0', 'imagine-image-edit', 'grok-imagine-video')
+	AND (
+		model_routes.origin = 'catalog'
+		OR EXISTS (
+			SELECT 1 FROM model_routes web_catalog_route
+			WHERE web_catalog_route.provider = model_routes.provider
+				AND web_catalog_route.upstream_model = model_routes.upstream_model
+				AND web_catalog_route.capability = model_routes.capability
+				AND web_catalog_route.origin = 'catalog'
+		)
+	))`
+
+const modelWebBasicMediaStaticSupportAvailabilityExpression = `(route.provider = 'grok_web'
+	AND route.upstream_model IN ('grok-imagine-image-quality', 'grok-imagine-image-2.0', 'imagine-image-edit', 'grok-imagine-video')
+	AND (
+		route.origin = 'catalog'
+		OR EXISTS (
+			SELECT 1 FROM model_routes web_catalog_route
+			WHERE web_catalog_route.provider = route.provider
+				AND web_catalog_route.upstream_model = route.upstream_model
+				AND web_catalog_route.capability = route.capability
+				AND web_catalog_route.origin = 'catalog'
+		)
+	))`
+
 const availableRoutePredicate = `
 	EXISTS (
 		SELECT 1 FROM provider_accounts account
@@ -65,6 +97,7 @@ const availableRoutePredicate = `
 					NOT EXISTS (SELECT 1 FROM model_route_accounts binding WHERE binding.model_route_id = model_routes.id)
 					AND (
 						` + modelConsoleStaticSupportExpression + `
+						OR ` + modelWebBasicMediaStaticSupportExpression + `
 						OR EXISTS (
 							SELECT 1 FROM account_model_capabilities capability
 							WHERE capability.account_id = account.id
@@ -143,6 +176,7 @@ const modelRouteAccountCapabilityPredicate = `(
 		NOT EXISTS (SELECT 1 FROM model_route_accounts binding WHERE binding.model_route_id = model_routes.id)
 		AND (
 			` + modelConsoleStaticSupportExpression + `
+			OR ` + modelWebBasicMediaStaticSupportExpression + `
 			OR EXISTS (
 				SELECT 1 FROM account_model_capabilities capability
 				WHERE capability.account_id = account.id
@@ -163,6 +197,7 @@ const modelAvailableRouteAccountCapabilityPredicate = `(
 		NOT EXISTS (SELECT 1 FROM model_route_accounts binding WHERE binding.model_route_id = model_routes.id)
 		AND (
 			` + modelConsoleStaticSupportExpression + `
+			OR ` + modelWebBasicMediaStaticSupportExpression + `
 			OR EXISTS (
 				SELECT 1 FROM account_model_capabilities capability
 				WHERE capability.account_id = account.id
@@ -207,7 +242,7 @@ func modelTierAvailabilityPredicateWithAvailability(tiers []string, activeOnly b
 
 const (
 	modelProviderPriorityExpression = "CASE model_routes.provider WHEN 'grok_build' THEN 0 WHEN 'grok_web' THEN 1 WHEN 'grok_console' THEN 2 ELSE 3 END"
-	modelSupportSortExpression      = `(SELECT COUNT(*) FROM provider_accounts account WHERE account.provider = model_routes.provider AND account.enabled = TRUE AND account.auth_status = 'active' AND (EXISTS (SELECT 1 FROM model_route_accounts binding WHERE binding.model_route_id = model_routes.id AND binding.account_id = account.id) OR (NOT EXISTS (SELECT 1 FROM model_route_accounts binding WHERE binding.model_route_id = model_routes.id) AND (` + modelConsoleStaticSupportExpression + ` OR EXISTS (SELECT 1 FROM account_model_capabilities capability WHERE capability.account_id = account.id AND capability.upstream_model = model_routes.upstream_model) OR ` + modelSharedPaidBuildSupportSortExpression + `))))`
+	modelSupportSortExpression      = `(SELECT COUNT(*) FROM provider_accounts account WHERE account.provider = model_routes.provider AND account.enabled = TRUE AND account.auth_status = 'active' AND (EXISTS (SELECT 1 FROM model_route_accounts binding WHERE binding.model_route_id = model_routes.id AND binding.account_id = account.id) OR (NOT EXISTS (SELECT 1 FROM model_route_accounts binding WHERE binding.model_route_id = model_routes.id) AND (` + modelConsoleStaticSupportExpression + ` OR ` + modelWebBasicMediaStaticSupportExpression + ` OR EXISTS (SELECT 1 FROM account_model_capabilities capability WHERE capability.account_id = account.id AND capability.upstream_model = model_routes.upstream_model) OR ` + modelSharedPaidBuildSupportSortExpression + `))))`
 	modelSyncedSortExpression       = `(SELECT MAX(sync.last_success_at) FROM provider_accounts account JOIN account_model_sync_states sync ON sync.account_id = account.id WHERE account.provider = model_routes.provider AND account.enabled = TRUE AND account.auth_status = 'active')`
 )
 
@@ -705,7 +740,14 @@ func (r *ModelRepository) UpsertDiscovered(ctx context.Context, provider account
 			if publicIDs[key] {
 				continue
 			}
+			// A discovered model whose canonical public ID is already reserved as
+			// another route compatibility alias cannot be inserted. Skip it and
+			// keep the rest of the batch: aborting here lets one historical rename
+			// permanently hide every future model of this provider.
 			if err := ensureModelPublicIDNotAlias(tx, publicID, 0); err != nil {
+				if errors.Is(err, repository.ErrConflict) {
+					continue
+				}
 				return err
 			}
 			publicIDs[key] = true
@@ -732,7 +774,9 @@ func discoveredRouteDefaults(provider account.Provider, upstreamModel string) (s
 		case "grok-imagine-image":
 			return "grok-imagine-image-lite", model.CapabilityImage
 		case "grok-imagine-image-quality":
-			return "grok-imagine-image-quality-lite", model.CapabilityImage
+			return "grok-imagine-image", model.CapabilityImage
+		case "grok-imagine-image-2.0":
+			return upstreamModel, model.CapabilityImage
 		case "imagine-image-edit":
 			return "grok-imagine-image-edit", model.CapabilityImageEdit
 		case "grok-imagine-video":
@@ -747,13 +791,17 @@ func discoveredRouteDefaults(provider account.Provider, upstreamModel string) (s
 		return upstreamModel, model.CapabilityResponses
 	case account.ProviderConsole:
 		switch upstreamModel {
-		case "grok-imagine-image", "grok-imagine-image-quality":
+		case "grok-imagine-image", "grok-imagine-image-quality", "grok-imagine-image-2.0":
 			// The catalog also registers image_edit for the same public model.
 			// Discovery only needs one existing managed capability to remain
 			// idempotent and must never synthesize a Responses route.
 			return upstreamModel, model.CapabilityImage
-		case "grok-imagine-video":
+		case "grok-imagine-video", "grok-imagine-video-1.5":
 			return upstreamModel, model.CapabilityVideo
+		case "grok-voice-latest", "grok-voice-think-fast-2.0", "grok-voice-think-fast-1.0":
+			return upstreamModel, model.CapabilityRealtime
+		case "grok-stt":
+			return upstreamModel, model.CapabilitySTT
 		default:
 			return upstreamModel, model.CapabilityResponses
 		}
@@ -882,6 +930,41 @@ func (r *ModelRepository) ReplaceProviderRoutes(ctx context.Context, provider ac
 				return err
 			}
 		}
+		// A catalog name may have multiple capability rows. When a previous
+		// catalog rename preserved that name as an alias to one member, restoring
+		// it must promote the alias back to the formal group name before every
+		// matched capability row is validated. A catalog rename may also move a
+		// historical alias from one reconciled route to another (for example when
+		// an upstream protocol gains distinct public products). This is safe only
+		// when the current owner is itself retained by this same catalog update;
+		// aliases owned by manual or unrelated routes remain conflicts.
+		matchedIDsByPublicID := make(map[string]map[uint64]struct{}, len(values))
+		for index, value := range values {
+			ids := matchedIDsByPublicID[value.PublicID]
+			if ids == nil {
+				ids = make(map[uint64]struct{})
+				matchedIDsByPublicID[value.PublicID] = ids
+			}
+			if row, ok := matched[index]; ok {
+				ids[row.ID] = struct{}{}
+			}
+		}
+		for publicID, routeIDs := range matchedIDsByPublicID {
+			var alias modelRouteAliasModel
+			err := tx.Where("alias = ?", publicID).First(&alias).Error
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				continue
+			}
+			if err != nil {
+				return err
+			}
+			if _, owned := routeIDs[alias.ModelRouteID]; !owned && !usedIDs[alias.ModelRouteID] {
+				return fmt.Errorf("%w: 模型公开 ID %q 已被路由 %d 保留为兼容名称", repository.ErrConflict, publicID, alias.ModelRouteID)
+			}
+			if err := tx.Delete(&modelRouteAliasModel{}, "alias = ?", publicID).Error; err != nil {
+				return err
+			}
+		}
 		for index, value := range values {
 			routeID := uint64(0)
 			if row, ok := matched[index]; ok {
@@ -895,9 +978,16 @@ func (r *ModelRepository) ReplaceProviderRoutes(ctx context.Context, provider ac
 		// stable route IDs and key permissions survive.
 		for index, row := range matched {
 			if row.PublicID != values[index].PublicID {
-				if err := preserveModelRouteAlias(tx, row.PublicID, row.ID); err != nil {
-					return err
+				if row.PublicID != retiredWebImageQualityLitePublicID {
+					if err := preserveModelRouteAlias(tx, row.PublicID, row.ID); err != nil {
+						return err
+					}
 				}
+			}
+		}
+		if provider == account.ProviderWeb {
+			if err := tx.Delete(&modelRouteAliasModel{}, "alias = ?", retiredWebImageQualityLitePublicID).Error; err != nil {
+				return err
 			}
 		}
 		for _, row := range matched {
@@ -1145,7 +1235,7 @@ func (r *ModelRepository) annotateAvailability(ctx context.Context, values []mod
 		SELECT route.id AS route_id,
 			CASE WHEN COUNT(DISTINCT binding.account_id) > 0
 				THEN COUNT(DISTINCT CASE WHEN account.enabled = TRUE AND account.auth_status = ? AND binding.account_id IS NOT NULL THEN account.id END)
-				ELSE COUNT(DISTINCT CASE WHEN account.enabled = TRUE AND account.auth_status = ? AND (`+modelConsoleStaticSupportAvailabilityExpression+` OR capability.account_id IS NOT NULL OR `+modelSharedPaidBuildSupportAvailabilityExpression+`) THEN account.id END)
+				ELSE COUNT(DISTINCT CASE WHEN account.enabled = TRUE AND account.auth_status = ? AND (`+modelConsoleStaticSupportAvailabilityExpression+` OR `+modelWebBasicMediaStaticSupportAvailabilityExpression+` OR capability.account_id IS NOT NULL OR `+modelSharedPaidBuildSupportAvailabilityExpression+`) THEN account.id END)
 			END AS supported_accounts,
 			CASE WHEN COUNT(DISTINCT binding.account_id) > 0
 				THEN COUNT(DISTINCT CASE WHEN account.enabled = TRUE AND account.auth_status = ? AND binding.account_id IS NOT NULL AND sync.last_success_at IS NOT NULL THEN account.id END)

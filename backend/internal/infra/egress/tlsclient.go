@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
@@ -15,6 +16,7 @@ import (
 	tlsclient "github.com/bogdanfinn/tls-client"
 	"github.com/bogdanfinn/tls-client/profiles"
 	"github.com/bogdanfinn/websocket"
+	"github.com/chenyme/grok2api/backend/internal/pkg/tunnelproxy"
 )
 
 type browserClient struct{ inner tlsclient.HttpClient }
@@ -22,6 +24,16 @@ type browserClient struct{ inner tlsclient.HttpClient }
 var chromeMajorPattern = regexp.MustCompile(`(?i)Chrome/(\d+)`)
 
 func (l *Lease) DialWebSocket(ctx context.Context, endpoint string, headers fhttp.Header, handshakeTimeout time.Duration) (*websocket.Conn, *fhttp.Response, error) {
+	return l.dialWebSocket(ctx, endpoint, headers, handshakeTimeout, true)
+}
+
+// DialWebSocketDeferredForbidden leaves a 403 handshake response for the
+// caller to classify before invalidating the browser-session Clearance.
+func (l *Lease) DialWebSocketDeferredForbidden(ctx context.Context, endpoint string, headers fhttp.Header, handshakeTimeout time.Duration) (*websocket.Conn, *fhttp.Response, error) {
+	return l.dialWebSocket(ctx, endpoint, headers, handshakeTimeout, false)
+}
+
+func (l *Lease) dialWebSocket(ctx context.Context, endpoint string, headers fhttp.Header, handshakeTimeout time.Duration, invalidateForbidden bool) (*websocket.Conn, *fhttp.Response, error) {
 	if l == nil || l.browser == nil {
 		return nil, nil, errors.New("当前出口客户端不支持浏览器 WebSocket")
 	}
@@ -36,7 +48,7 @@ func (l *Lease) DialWebSocket(ctx context.Context, endpoint string, headers fhtt
 			if l.proxyPool && safeProxyConnectionFailure(err, fhttpResponseAsHTTP(response)) {
 				l.browser.CloseIdleConnections()
 			}
-			if response != nil && response.StatusCode == http.StatusForbidden && l.clearanceManager != nil && l.clearanceKey != "" {
+			if invalidateForbidden && response != nil && response.StatusCode == http.StatusForbidden && l.clearanceManager != nil && l.clearanceKey != "" {
 				l.clearanceManager.invalidateClearanceKey(l.clearanceKey, l.client)
 			}
 			return connection, response, err
@@ -62,7 +74,19 @@ func newBrowserClient(proxyURL, userAgent string) (*browserClient, error) {
 		tlsclient.WithNotFollowRedirects(),
 	}
 	if proxyURL != "" {
-		options = append(options, tlsclient.WithProxyUrl(proxyURL))
+		parsed, err := url.Parse(proxyURL)
+		if err != nil {
+			return nil, fmt.Errorf("解析浏览器出口代理: %w", err)
+		}
+		if tunnelproxy.IsSupportedScheme(parsed.Scheme) {
+			dialer, err := tunnelproxy.NewDialer(proxyURL)
+			if err != nil {
+				return nil, fmt.Errorf("创建浏览器隧道代理: %w", err)
+			}
+			options = append(options, tlsclient.WithDialContext(dialer.DialContext))
+		} else {
+			options = append(options, tlsclient.WithProxyUrl(proxyURL))
+		}
 	}
 	client, err := tlsclient.NewHttpClient(tlsclient.NewNoopLogger(), options...)
 	if err != nil {

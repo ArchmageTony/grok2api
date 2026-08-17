@@ -44,6 +44,9 @@ func TestRoutingProjectionLeavesSecretsAndLargeJSONOutOfCandidateLoad(t *testing
 		AccountID: created.ID, Mode: "weekly", Remaining: 10, Total: 20, UsagePercent: 50,
 		Breakdown:     []account.QuotaBreakdown{{ProductCode: account.QuotaProductChat, UsagePercent: 50}},
 		WindowSeconds: 3600, ResetAt: &resetAt, SyncedAt: &now, Source: account.QuotaSourceUpstream,
+	}, {
+		AccountID: created.ID, Mode: account.QuotaModeWebImagePro, Remaining: 3,
+		WindowSeconds: 86400, SyncedAt: &now, Source: account.QuotaSourceUpstream,
 	}}); err != nil {
 		t.Fatal(err)
 	}
@@ -61,6 +64,13 @@ func TestRoutingProjectionLeavesSecretsAndLargeJSONOutOfCandidateLoad(t *testing
 	}
 	if bases[0].QuotaWindow == nil || bases[0].QuotaWindow.Remaining != 10 || len(bases[0].QuotaWindow.Breakdown) != 0 {
 		t.Fatalf("routing quota = %#v, want scalar quota without breakdown", bases[0].QuotaWindow)
+	}
+	imagineBases, err := accounts.ListRoutingAccountBases(ctx, account.ProviderWeb, account.QuotaModeWebImagePro)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(imagineBases) != 1 || imagineBases[0].QuotaWindow == nil || imagineBases[0].QuotaWindow.Mode != account.QuotaModeWebImagePro || imagineBases[0].QuotaWindow.Remaining != 3 {
+		t.Fatalf("Imagine routing quota = %#v", imagineBases)
 	}
 
 	candidates, err := accounts.ListRoutingCandidates(ctx, account.ProviderWeb, 0, "grok-test", "")
@@ -94,8 +104,54 @@ func TestRoutingProjectionLeavesSecretsAndLargeJSONOutOfCandidateLoad(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(windows[created.ID]) != 1 || len(windows[created.ID][0].Breakdown) != 1 {
-		t.Fatalf("management quota windows = %#v, want breakdown", windows)
+	if len(windows[created.ID]) != 2 {
+		t.Fatalf("management quota windows = %#v, want two modes", windows)
+	}
+}
+
+func TestRoutingProjectionMapsWebImageEditQuotaByTier(t *testing.T) {
+	ctx := context.Background()
+	database, err := OpenSQLite(ctx, filepath.Join(t.TempDir(), "routing-web-edit-quota.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	accounts := NewAccountRepository(database)
+	now := time.Now().UTC()
+	create := func(name string, tier account.WebTier) account.Credential {
+		value, _, createErr := accounts.UpsertByIdentity(ctx, account.Credential{
+			Provider: account.ProviderWeb, AuthType: account.AuthTypeSSO, Name: name, SourceKey: name,
+			EncryptedAccessToken: "encrypted", Enabled: true, AuthStatus: account.AuthStatusActive, WebTier: tier,
+		})
+		if createErr != nil {
+			t.Fatal(createErr)
+		}
+		if saveErr := accounts.SaveQuotaWindows(ctx, value.ID, tier, now, []account.QuotaWindow{
+			{AccountID: value.ID, Mode: account.QuotaModeWebImagePro, Remaining: 3, SyncedAt: &now, Source: account.QuotaSourceUpstream},
+			{AccountID: value.ID, Mode: account.QuotaModeWebImageEdit, Remaining: 7, SyncedAt: &now, Source: account.QuotaSourceUpstream},
+		}); saveErr != nil {
+			t.Fatal(saveErr)
+		}
+		return value
+	}
+	basic := create("basic", account.WebTierBasic)
+	super := create("super", account.WebTierSuper)
+	bases, err := accounts.ListRoutingAccountBases(ctx, account.ProviderWeb, account.QuotaModeWebImageEdit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byID := make(map[uint64]account.RoutingAccountBase, len(bases))
+	for _, base := range bases {
+		byID[base.Credential.ID] = base
+	}
+	if got := byID[basic.ID].QuotaWindow; got == nil || got.Mode != account.QuotaModeWebImagePro || got.Remaining != 3 {
+		t.Fatalf("Basic image-edit quota = %#v", got)
+	}
+	if got := byID[super.ID].QuotaWindow; got == nil || got.Mode != account.QuotaModeWebImageEdit || got.Remaining != 7 {
+		t.Fatalf("Super image-edit quota = %#v", got)
 	}
 }
 

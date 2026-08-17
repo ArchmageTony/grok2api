@@ -53,6 +53,61 @@ func TestConvertChatRequestToResponses(t *testing.T) {
 	}
 }
 
+func TestConvertChatPreservesWebSearchExcludedDomains(t *testing.T) {
+	converted, err := ConvertRequest([]byte(`{
+		"model":"public-chat","messages":[{"role":"user","content":"search"}],
+		"tools":[{"type":"web_search","filters":{"excluded_domains":["blocked.example"]}}]
+	}`), "grok-4.6", OperationChat)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(converted, &payload); err != nil {
+		t.Fatal(err)
+	}
+	tool := payload["tools"].([]any)[0].(map[string]any)
+	domains := tool["filters"].(map[string]any)["excluded_domains"].([]any)
+	if len(domains) != 1 || domains[0] != "blocked.example" {
+		t.Fatalf("excluded_domains = %#v", tool)
+	}
+}
+
+func TestConvertChatValidatesWebSearchDomainFilters(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		tool    string
+		wantErr bool
+	}{
+		{name: "identical nested and top level", tool: `{"type":"web_search","filters":{"allowed_domains":["same.example"]},"allowed_domains":["same.example"]}`},
+		{name: "conflicting duplicate", tool: `{"type":"web_search","filters":{"allowed_domains":["nested.example"]},"allowed_domains":["top.example"]}`, wantErr: true},
+		{name: "allow and exclude", tool: `{"type":"web_search","filters":{"allowed_domains":["allow.example"],"excluded_domains":["deny.example"]}}`, wantErr: true},
+		{name: "six domains", tool: `{"type":"web_search","excluded_domains":["a.example","b.example","c.example","d.example","e.example","f.example"]}`, wantErr: true},
+		{name: "invalid filters type", tool: `{"type":"web_search","filters":"invalid"}`, wantErr: true},
+		{name: "empty filters omitted", tool: `{"type":"web_search","filters":{"allowed_domains":null,"excluded_domains":[]}}`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			converted, err := ConvertRequest([]byte(`{
+				"model":"public-chat","messages":[{"role":"user","content":"search"}],
+				"tools":[`+test.tool+`]
+			}`), "grok-4.6", OperationChat)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("conversion error = %v, wantErr %v", err, test.wantErr)
+			}
+			if err != nil {
+				return
+			}
+			var payload map[string]any
+			if err := json.Unmarshal(converted, &payload); err != nil {
+				t.Fatal(err)
+			}
+			tool := payload["tools"].([]any)[0].(map[string]any)
+			if test.name == "empty filters omitted" && len(tool) != 1 {
+				t.Fatalf("empty filters were not omitted: %#v", tool)
+			}
+		})
+	}
+}
+
 func TestConvertChatToolImageResultToMultimodalFunctionOutput(t *testing.T) {
 	body := []byte(`{
 		"model":"public-chat",
@@ -512,6 +567,28 @@ func TestConvertAnthropicWebSearchControls(t *testing.T) {
 	if len(tool) != 1 || tool["type"] != "web_search" {
 		t.Fatalf("downgraded tool = %#v", tool)
 	}
+
+	converted, _, err = ConvertRequestWithOptions([]byte(`{
+		"model":"public","max_tokens":64,"messages":[{"role":"user","content":"search"}],
+		"tools":[{"type":"web_search_20250305","name":"web_search","blocked_domains":["blocked.example"]}]
+	}`), "grok-4.6", OperationMessages)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload = nil
+	_ = json.Unmarshal(converted, &payload)
+	tool = payload["tools"].([]any)[0].(map[string]any)
+	domains = tool["filters"].(map[string]any)["excluded_domains"].([]any)
+	if len(domains) != 1 || domains[0] != "blocked.example" {
+		t.Fatalf("blocked_domains conversion = %#v", tool)
+	}
+
+	if _, _, err = ConvertRequestWithOptions([]byte(`{
+		"model":"public","max_tokens":64,"messages":[{"role":"user","content":"search"}],
+		"tools":[{"type":"web_search_20250305","name":"web_search","allowed_domains":["allow.example"],"blocked_domains":["blocked.example"]}]
+	}`), "grok-4.6", OperationMessages); err == nil {
+		t.Fatal("allowed_domains + blocked_domains must be rejected")
+	}
 }
 
 func TestConvertResponsesJSONToChatAndMessages(t *testing.T) {
@@ -784,6 +861,35 @@ func TestConvertResponsesStreamChatErrorIsTerminal(t *testing.T) {
 	}
 	if strings.Count(value, "data: [DONE]") != 1 {
 		t.Fatalf("error stream must send one terminator: %s", value)
+	}
+}
+
+func TestConvertResponsesStreamMarksChatReasoningStart(t *testing.T) {
+	stream := strings.Join([]string{
+		`event: response.created`,
+		`data: {"type":"response.created","response":{"id":"resp_1","model":"grok-4.6"}}`, "",
+		`event: response.output_item.added`,
+		`data: {"type":"response.output_item.added","item":{"id":"rs_1","type":"reasoning","status":"in_progress"}}`, "",
+		`event: response.output_item.added`,
+		`data: {"type":"response.output_item.added","item":{"id":"rs_1","type":"reasoning"}}`, "",
+		`event: response.output_text.delta`,
+		`data: {"type":"response.output_text.delta","delta":"hi"}`, "",
+		`event: response.completed`,
+		`data: {"type":"response.completed","response":{"status":"completed"}}`, "", "",
+	}, "\n")
+	converted, err := io.ReadAll(ConvertResponseStream(io.NopCloser(strings.NewReader(stream)), OperationChat))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(converted)
+	if strings.Count(text, ": grok2api-reasoning-start\n\n") != 1 {
+		t.Fatalf("expected one reasoning start marker: %s", text)
+	}
+	if strings.Contains(text, "reasoning_started") {
+		t.Fatalf("internal timing marker leaked into Chat JSON: %s", text)
+	}
+	if !strings.Contains(text, `"content":"hi"`) {
+		t.Fatalf("missing visible content: %s", text)
 	}
 }
 

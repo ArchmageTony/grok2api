@@ -20,6 +20,7 @@ import (
 
 	"github.com/chenyme/grok2api/backend/internal/domain/account"
 	inferencedomain "github.com/chenyme/grok2api/backend/internal/domain/inference"
+	modeldomain "github.com/chenyme/grok2api/backend/internal/domain/model"
 	infraegress "github.com/chenyme/grok2api/backend/internal/infra/egress"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider/conversation"
@@ -62,6 +63,8 @@ type openAIRequest struct {
 	ImageConfig       *struct {
 		Count          *int   `json:"n"`
 		ResponseFormat string `json:"response_format"`
+		AspectRatio    string `json:"aspect_ratio"`
+		Resolution     string `json:"resolution"`
 	} `json:"image_config"`
 }
 
@@ -209,7 +212,14 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 	if len(input.Include) > 0 {
 		conversationOptions.Include = append([]string{}, input.Include...)
 	}
-	normalized, err := normalizeOpenAIInput(input, request.Operation)
+	spec, modelKnown := Resolve(request.Model)
+	var normalized normalizedChatInput
+	var err error
+	if modelKnown && spec.Capability == modeldomain.CapabilityImage {
+		normalized, err = normalizeLatestImageInput(input, request.Operation)
+	} else {
+		normalized, err = normalizeOpenAIInput(input, request.Operation)
+	}
 	if err != nil {
 		return jsonProviderResponse(http.StatusBadRequest, map[string]any{"error": map[string]any{"message": err.Error(), "type": "invalid_request_error"}}), nil
 	}
@@ -221,14 +231,16 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 	if input.ParallelToolCalls != nil {
 		parallelTools = *input.ParallelToolCalls
 	}
-	spec, ok := Resolve(request.Model)
-	if ok && spec.ProtocolModel == "imagine-lite" && request.Operation == "chat" {
+	if modelKnown && spec.Capability == modeldomain.CapabilityImage {
 		if len(tools.ResponseTools) > 0 {
-			return invalidImageRequest("grok-imagine-image-lite 不支持 tools")
+			return invalidImageRequest("图片生成模型不支持 tools")
 		}
-		return a.forwardLiteChatCompletion(ctx, request, input, normalized, spec)
+		return a.forwardImageChatCompletion(ctx, request, input, normalized, spec)
 	}
-	if !ok || spec.Capability != "chat" {
+	if modelKnown && spec.Capability == modeldomain.CapabilityImageEdit {
+		return invalidImageRequest("图片编辑模型请使用 /v1/images/edits，并在当前请求中显式提供输入图片")
+	}
+	if !modelKnown || spec.Capability != modeldomain.CapabilityChat {
 		return jsonProviderResponse(http.StatusBadRequest, map[string]any{"error": map[string]any{"message": "模型不支持文本对话", "type": "invalid_request_error"}}), nil
 	}
 
@@ -242,7 +254,7 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 		if attempt > 0 {
 			attemptCtx = infraegress.WithPhysicalCallStage(ctx, "anti_bot_retry")
 		}
-		upstream, lease, currentPrevious, statsigTarget, openErr := a.openChat(attemptCtx, request.Credential, input.PreviousResponseID, spec, normalized, true)
+		upstream, lease, currentPrevious, statsigTarget, openErr := a.openChat(attemptCtx, request.Credential, input.PreviousResponseID, spec, normalized, gatewayOpenOptions{enforceStreamIdle: true})
 		if openErr != nil {
 			if errors.Is(openErr, errInvalidChatAttachment) || errors.Is(openErr, errInvalidChatImage) || errors.Is(openErr, errInvalidChatFile) {
 				code := "invalid_attachment_input"
@@ -406,8 +418,8 @@ func preflightUpstream(source io.ReadCloser) (io.ReadCloser, error) {
 	return nil, fmt.Errorf("Grok Web 首个流事件超过安全检查上限")
 }
 
-func (a *Adapter) openChat(ctx context.Context, credential account.Credential, previousResponseID string, spec ModelSpec, input normalizedChatInput, enforceStreamIdle bool) (*http.Response, *infraegress.Lease, *inferencedomain.WebResponseState, string, error) {
-	return a.openGatewayChat(ctx, credential, previousResponseID, spec, input, enforceStreamIdle)
+func (a *Adapter) openChat(ctx context.Context, credential account.Credential, previousResponseID string, spec ModelSpec, input normalizedChatInput, options gatewayOpenOptions) (*http.Response, *infraegress.Lease, *inferencedomain.WebResponseState, string, error) {
+	return a.openGatewayChat(ctx, credential, previousResponseID, spec, input, options)
 }
 
 func (a *Adapter) handleResponseResource(ctx context.Context, request provider.ResponseResourceRequest) (*provider.Response, error) {
@@ -734,6 +746,63 @@ func normalizeOpenAIInput(input openAIRequest, operation string) (normalizedChat
 		return normalizedChatInput{}, fmt.Errorf("单次对话最多支持 %d 个附件", maxChatAttachments)
 	}
 	return normalizedChatInput{Prompt: value, Attachments: attachments}, nil
+}
+
+// Image generation is stateless: only the latest user turn is a prompt. In
+// particular, assistant images from an OpenAI-compatible client's history must
+// not be reinterpreted as image-edit inputs on the next generation request.
+func normalizeLatestImageInput(input openAIRequest, operation string) (normalizedChatInput, error) {
+	if operation == conversation.OperationChat {
+		for index := len(input.Messages) - 1; index >= 0; index-- {
+			message := input.Messages[index]
+			if !strings.EqualFold(strings.TrimSpace(message.Role), "user") {
+				continue
+			}
+			return normalizeImageMessage(message.Content)
+		}
+		return normalizedChatInput{}, errors.New("messages 中缺少用户消息")
+	}
+
+	trimmed := bytes.TrimSpace(input.Input)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return normalizedChatInput{}, errors.New("input 不能为空")
+	}
+	if trimmed[0] == '"' {
+		var prompt string
+		if json.Unmarshal(trimmed, &prompt) != nil {
+			return normalizedChatInput{}, errors.New("input 格式无效")
+		}
+		prompt = strings.TrimSpace(prompt)
+		if prompt == "" {
+			return normalizedChatInput{}, errors.New("图片生成提示词不能为空")
+		}
+		return normalizedChatInput{Prompt: prompt}, nil
+	}
+
+	var messages []chatMessage
+	if json.Unmarshal(trimmed, &messages) != nil {
+		return normalizedChatInput{}, errors.New("input 必须是字符串或消息数组")
+	}
+	for index := len(messages) - 1; index >= 0; index-- {
+		message := messages[index]
+		typeName := strings.ToLower(strings.TrimSpace(message.Type))
+		if (typeName == "" || typeName == "message") && strings.EqualFold(strings.TrimSpace(message.Role), "user") {
+			return normalizeImageMessage(message.Content)
+		}
+	}
+	return normalizedChatInput{}, errors.New("input 中缺少用户消息")
+}
+
+func normalizeImageMessage(content json.RawMessage) (normalizedChatInput, error) {
+	prompt, attachments, err := contentTextAndAttachments(content)
+	if err != nil {
+		return normalizedChatInput{}, err
+	}
+	prompt = strings.TrimSpace(prompt)
+	if prompt == "" && len(attachments) == 0 {
+		return normalizedChatInput{}, errors.New("图片生成提示词不能为空")
+	}
+	return normalizedChatInput{Prompt: prompt, Attachments: attachments}, nil
 }
 
 func rawTextValue(raw json.RawMessage) (string, error) {

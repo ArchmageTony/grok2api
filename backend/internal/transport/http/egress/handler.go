@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	egressapp "github.com/chenyme/grok2api/backend/internal/application/egress"
@@ -26,6 +27,7 @@ type Handler struct {
 	guardStatePath  string
 	guardConfigPath string
 	guardProbe      egressapp.QualityProbeInput
+	profilesMu      sync.Mutex
 }
 
 func NewHandler(service *egressapp.Service, guardStatePath ...string) *Handler {
@@ -59,6 +61,10 @@ func (h *Handler) Register(router *gin.RouterGroup) {
 	router.POST("/egress-nodes/:id/quality-test", h.testQuality)
 	router.GET("/egress-quality-guard", h.qualityGuardStatus)
 	router.PUT("/egress-quality-guard/config", h.updateQualityGuardConfig)
+	router.GET("/egress-quality-guard/profiles", h.listQualityGuardProfiles)
+	router.POST("/egress-quality-guard/profiles", h.createQualityGuardProfile)
+	router.PUT("/egress-quality-guard/profiles/:id", h.updateQualityGuardProfile)
+	router.DELETE("/egress-quality-guard/profiles/:id", h.deleteQualityGuardProfile)
 	router.POST("/egress-quality-guard/nodes/:id/test", h.testQualityGuardNode)
 	router.POST("/egress-nodes/:id/accounts", h.assignAccounts)
 	router.DELETE("/egress-nodes/accounts", h.unassignAccounts)
@@ -174,6 +180,8 @@ type qualityGuardConfig struct {
 	QuarantineSeconds     int      `json:"quarantine_seconds"`
 	MinHealthyNodes       int      `json:"min_healthy_nodes"`
 	MaxOutputTokens       int      `json:"max_output_tokens"`
+	FailClosed            bool     `json:"fail_closed"`
+	MinGenerationMS       int      `json:"min_generation_ms"`
 	Prompt                string   `json:"prompt"`
 	Expected              string   `json:"expected"`
 }
@@ -229,11 +237,16 @@ func (h *Handler) qualityGuardStatus(c *gin.Context) {
 			"hard_tps": state.Guard.HardTPS, "consecutive_soft": state.Guard.ConsecutiveSoft,
 			"consecutive_errors": state.Guard.ConsecutiveErrors, "quarantine_seconds": state.Guard.QuarantineSeconds,
 			"min_healthy_nodes": state.Guard.MinHealthyNodes, "max_output_tokens": state.Guard.MaxOutputTokens,
+			"fail_closed": state.Guard.FailClosed, "min_generation_ms": state.Guard.MinGenerationMS,
 		},
 		"nodes": state.Nodes, "protectedNodeIds": state.ProtectedNodeIDs, "recentEvents": state.RecentEvents,
 	}
 	if state.Statistics.StartedAt > 0 {
 		payload["statistics"] = state.Statistics
+	}
+	if profiles, err := loadProbeProfileFile(h.profilesPath()); err == nil {
+		payload["activeProfileId"] = profiles.ActiveProfileID
+		payload["profiles"] = profiles.summaries()
 	}
 	response.Success(c, http.StatusOK, payload)
 }
@@ -393,11 +406,24 @@ func (h *Handler) testQualityGuardNode(c *gin.Context) {
 	if !ok {
 		return
 	}
-	if h.guardProbe.ClientKeyID == 0 || strings.TrimSpace(h.guardProbe.Model) == "" || h.guardProbe.Prompt == "" || h.guardProbe.Expected == "" {
+	if h.guardProbe.ClientKeyID == 0 || strings.TrimSpace(h.guardProbe.Model) == "" {
 		response.Error(c, http.StatusServiceUnavailable, "qualityGuardUnavailable", "质量守护配置暂不可用")
 		return
 	}
-	value, err := h.service.ProbeQuality(c.Request.Context(), nodeID, h.guardProbe)
+	var request struct {
+		ProfileID string `json:"profileId"`
+	}
+	_ = c.ShouldBindJSON(&request)
+	input, err := h.resolveProbeInput(strings.TrimSpace(request.ProfileID))
+	if err != nil {
+		response.Error(c, http.StatusBadRequest, "invalidRequest", err.Error())
+		return
+	}
+	if strings.TrimSpace(input.Prompt) == "" {
+		response.Error(c, http.StatusServiceUnavailable, "qualityGuardUnavailable", "质量守护配置暂不可用")
+		return
+	}
+	value, err := h.service.ProbeQuality(c.Request.Context(), nodeID, input)
 	if err != nil {
 		h.writeQualityProbeError(c, err)
 		return
@@ -410,7 +436,8 @@ func (h *Handler) testQualityGuardNode(c *gin.Context) {
 		"visibleTokens": value.VisibleTokens, "visibleCharacters": value.VisibleCharacters,
 		"outputTokensPerSecond":  value.OutputTokensPerSecond,
 		"visibleTokensPerSecond": value.OutputTokensPerSecond, "expectedMatched": value.ExpectedMatched,
-		"responseSha256": value.ResponseSHA256,
+		"thinkingRequired": value.ThinkingRequired,
+		"responseSha256":   value.ResponseSHA256,
 	})
 }
 
@@ -548,7 +575,8 @@ func (h *Handler) testQuality(c *gin.Context) {
 		"visibleTokens": value.VisibleTokens, "visibleCharacters": value.VisibleCharacters,
 		"outputTokensPerSecond":  value.OutputTokensPerSecond,
 		"visibleTokensPerSecond": value.OutputTokensPerSecond, "expectedMatched": value.ExpectedMatched,
-		"responseSha256": value.ResponseSHA256,
+		"thinkingRequired": value.ThinkingRequired,
+		"responseSha256":   value.ResponseSHA256,
 	})
 }
 
@@ -835,6 +863,8 @@ type sourceRequest struct {
 	Enabled                bool    `json:"enabled"`
 	URL                    *string `json:"url"`
 	ClearURL               bool    `json:"clearUrl"`
+	ProxyURL               *string `json:"proxyURL"`
+	ClearProxyURL          bool    `json:"clearProxyURL"`
 	RefreshIntervalSeconds *int    `json:"refreshIntervalSeconds"`
 	DefaultAccountCapacity *int    `json:"defaultAccountCapacity"`
 }
@@ -845,6 +875,7 @@ type sourceResponse struct {
 	Scope                  string     `json:"scope"`
 	Enabled                bool       `json:"enabled"`
 	URLConfigured          bool       `json:"urlConfigured"`
+	ProxyConfigured        bool       `json:"proxyConfigured"`
 	RefreshIntervalSeconds int        `json:"refreshIntervalSeconds"`
 	DefaultAccountCapacity int        `json:"defaultAccountCapacity"`
 	LastSyncedAt           *time.Time `json:"lastSyncedAt,omitempty"`
@@ -870,8 +901,6 @@ type operationsConfigRequest struct {
 	AutoAssignEnabled         bool                                 `json:"autoAssignEnabled"`
 	AutoBalanceEnabled        bool                                 `json:"autoBalanceEnabled"`
 	AssignmentIntervalSeconds int                                  `json:"assignmentIntervalSeconds"`
-	SubscriptionProxyURL      *string                              `json:"subscriptionProxyURL,omitempty"`
-	ClearSubscriptionProxy    bool                                 `json:"clearSubscriptionProxy,omitempty"`
 	Fallbacks                 map[string]operationsFallbackRequest `json:"fallbacks"`
 }
 
@@ -881,14 +910,13 @@ type operationsFallbackRequest struct {
 }
 
 type operationsConfigResponse struct {
-	ProbeProvider               string                                `json:"probeProvider"`
-	ProbeIntervalSeconds        int                                   `json:"probeIntervalSeconds"`
-	AutoAssignEnabled           bool                                  `json:"autoAssignEnabled"`
-	AutoBalanceEnabled          bool                                  `json:"autoBalanceEnabled"`
-	AssignmentIntervalSeconds   int                                   `json:"assignmentIntervalSeconds"`
-	SubscriptionProxyConfigured bool                                  `json:"subscriptionProxyConfigured"`
-	Fallbacks                   map[string]operationsFallbackResponse `json:"fallbacks"`
-	UpdatedAt                   time.Time                             `json:"updatedAt"`
+	ProbeProvider             string                                `json:"probeProvider"`
+	ProbeIntervalSeconds      int                                   `json:"probeIntervalSeconds"`
+	AutoAssignEnabled         bool                                  `json:"autoAssignEnabled"`
+	AutoBalanceEnabled        bool                                  `json:"autoBalanceEnabled"`
+	AssignmentIntervalSeconds int                                   `json:"assignmentIntervalSeconds"`
+	Fallbacks                 map[string]operationsFallbackResponse `json:"fallbacks"`
+	UpdatedAt                 time.Time                             `json:"updatedAt"`
 }
 
 type operationsFallbackResponse struct {
@@ -900,12 +928,6 @@ func (value operationsConfigRequest) input() (egressapp.OperationsConfigInput, e
 	result := egressapp.OperationsConfigInput{
 		ProbeProvider: egressdomain.ProbeProvider(strings.TrimSpace(value.ProbeProvider)), ProbeIntervalSeconds: value.ProbeIntervalSeconds, AutoAssignEnabled: value.AutoAssignEnabled,
 		AutoBalanceEnabled: value.AutoBalanceEnabled, AssignmentIntervalSeconds: value.AssignmentIntervalSeconds,
-	}
-	if value.SubscriptionProxyURL != nil {
-		result.SubscriptionProxyURL = value.SubscriptionProxyURL
-	}
-	if value.ClearSubscriptionProxy {
-		result.ClearSubscriptionProxy = true
 	}
 	if value.Fallbacks == nil {
 		return result, nil
@@ -930,6 +952,7 @@ func (value operationsConfigRequest) input() (egressapp.OperationsConfigInput, e
 func (value sourceRequest) input() egressapp.SubscriptionSourceInput {
 	return egressapp.SubscriptionSourceInput{
 		Name: value.Name, Scope: egressdomain.Scope(value.Scope), Enabled: value.Enabled, URL: value.URL, ClearURL: value.ClearURL,
+		ProxyURL: value.ProxyURL, ClearProxyURL: value.ClearProxyURL,
 		RefreshIntervalSeconds: value.RefreshIntervalSeconds, DefaultAccountCapacity: value.DefaultAccountCapacity,
 	}
 }
@@ -937,6 +960,7 @@ func (value sourceRequest) input() egressapp.SubscriptionSourceInput {
 func newSourceResponse(value egressdomain.PublicSubscriptionSource) sourceResponse {
 	return sourceResponse{
 		ID: value.ID, Name: value.Name, Scope: string(value.Scope), Enabled: value.Enabled, URLConfigured: value.URLConfigured,
+		ProxyConfigured:        value.ProxyConfigured,
 		RefreshIntervalSeconds: value.RefreshIntervalSeconds, DefaultAccountCapacity: value.DefaultAccountCapacity,
 		LastSyncedAt: value.LastSyncedAt, NextSyncAt: value.NextSyncAt, LastSyncImported: value.LastSyncImported, LastSyncError: value.LastSyncError,
 	}
@@ -955,8 +979,7 @@ func newOperationsConfigResponse(value egressdomain.OperationsConfig) operations
 	return operationsConfigResponse{
 		ProbeProvider: string(value.ProbeProvider.Normalized()), ProbeIntervalSeconds: value.ProbeIntervalSeconds, AutoAssignEnabled: value.AutoAssignEnabled,
 		AutoBalanceEnabled: value.AutoBalanceEnabled, AssignmentIntervalSeconds: value.AssignmentIntervalSeconds,
-		SubscriptionProxyConfigured: value.EncryptedSubscriptionProxyURL != "",
-		Fallbacks:                   fallbacks, UpdatedAt: value.UpdatedAt,
+		Fallbacks: fallbacks, UpdatedAt: value.UpdatedAt,
 	}
 }
 
