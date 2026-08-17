@@ -400,6 +400,7 @@ function Policy({ status, onEdit }: { status: QualityGuardStatus; onEdit: () => 
   const { t } = useTranslation();
   const config = status.config;
   if (!config) return null;
+  const activeProfile = status.profiles?.find((profile) => profile.id === status.activeProfileId);
   const rows = [
     [t("qualityGuard.softThreshold"), `${formatTPS(config.soft_tps)} × ${config.consecutive_soft}`],
     [t("qualityGuard.hardThreshold"), formatTPS(config.hard_tps)],
@@ -408,6 +409,12 @@ function Policy({ status, onEdit }: { status: QualityGuardStatus; onEdit: () => 
     [t("qualityGuard.quarantineDuration"), formatDuration(config.quarantine_seconds)],
     [t("qualityGuard.minimumNodes"), String(config.min_healthy_nodes)],
   ];
+  if (activeProfile) {
+    rows.push([t("qualityGuard.profilesTab"), activeProfile.name || activeProfile.id]);
+    if (activeProfile.require_thinking) {
+      rows.push(["missing_thinking", t("qualityGuard.missingThinkingPolicy", { tokens: 64 })]);
+    }
+  }
   return <section className="rounded-lg bg-card p-4 sm:p-5" aria-labelledby="guard-policy-title">
     <div className="flex items-center justify-between gap-3">
       <div className="flex items-center gap-2"><Zap className="size-4 text-muted-foreground" /><h2 id="guard-policy-title" className="text-sm font-medium">{t("qualityGuard.policy")}</h2></div>
