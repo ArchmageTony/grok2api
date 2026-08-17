@@ -11,10 +11,10 @@ enhancement distribution:
 - 3 hits within a rolling 24h window mute the account long-term; a muted
   account is never re-enabled by this guard and needs an operator.
 
-Deliberate deviation from the enhancement sidecar: arbitrary user traffic is
-never classified as missing_thinking. Reasoning tokens can be legitimately
-absent (non-reasoning model, reasoning disabled per request), so only the
-panel-equivalent TPS thresholds count as account degrade hits.
+A hit is either the panel-equivalent TPS (including reasoning tokens) crossing
+the soft/hard thresholds, or a completed reply with >= 32 output tokens and
+zero reasoning tokens (missing_thinking). Deployment policy deliberately
+accepts false mutes in exchange for quality: accounts are plentiful.
 
 The process makes outbound calls only: the internal audit API (quality-guard
 token from bootstrap.json) and the admin API (login with operator-injected
@@ -258,6 +258,9 @@ def classify_audit(value: dict[str, Any], config: Config) -> tuple[str, float]:
     if generation_ms <= 0 or output_tokens < MIN_OUTPUT_TOKENS:
         return "", 0.0
     speed = float(output_tokens) * 1000 / float(generation_ms)
+    # 推理 Token 缺失按降智处理: 宁可误禁也不放过(号多, 质量优先)。
+    if max(0, int(value.get("reasoningTokens") or 0)) <= 0:
+        return "missing_thinking", speed
     if config.hard_tps > 0 and speed >= config.hard_tps:
         return "hard_tps", speed
     if config.soft_tps > 0 and speed >= config.soft_tps:

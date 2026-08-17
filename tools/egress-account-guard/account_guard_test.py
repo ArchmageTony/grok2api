@@ -99,9 +99,14 @@ class ClassifyAuditTest(unittest.TestCase):
         reason, _ = account_guard.classify_audit(audit(first_token_ms=None), self.config)
         self.assertEqual(reason, "")
 
-    def test_ignores_zero_reasoning_user_traffic(self):
-        # 用户流量可能合法关闭推理; 无推理 Token 不算账号降智。
+    def test_zero_reasoning_user_traffic_is_a_hit(self):
+        # 部署策略为质量优先: 用户流量无推理 Token 也计为降智命中。
         reason, _ = account_guard.classify_audit(audit(reasoningTokens=0), self.config)
+        self.assertEqual(reason, "missing_thinking")
+
+    def test_zero_reasoning_short_reply_ignored(self):
+        # 短回复不要求推理。
+        reason, _ = account_guard.classify_audit(audit(reasoningTokens=0, output_tokens=10), self.config)
         self.assertEqual(reason, "")
 
     def test_soft_and_hard_thresholds(self):
