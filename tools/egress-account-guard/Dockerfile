@@ -1,5 +1,7 @@
 FROM python:3.12-alpine
 
+RUN pip install --no-cache-dir pyyaml
+
 # 与质量守护 sidecar 共用 uid 10001: bootstrap 卷权限为 0700,
 # 只有同一 uid 才能读取其中的内部凭据。
 RUN addgroup -S -g 10001 quality-guard && \

@@ -37,6 +37,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import yaml
+
 INTERNAL_API_PREFIX = "/api/internal/v1/quality-guard"
 BOOTSTRAP_FILE = Path(os.environ.get("GROK2API_BOOTSTRAP_FILE") or "/var/lib/grok2api-quality-guard/bootstrap.json")
 STATE_DIR = Path(os.environ.get("ACCOUNT_GUARD_STATE_DIR") or "/var/lib/grok2api-account-guard")
@@ -123,10 +125,22 @@ class Config:
         token = str(payload.get("internal_token") or "").strip()
         if not token:
             raise ValueError("bootstrap internal_token is missing")
+        # 管理员凭据优先级: 环境变量 > config.yaml 的 bootstrapAdmin 段。
+        username = (os.environ.get("GROK2API_ADMIN_USERNAME") or "").strip()
         password = os.environ.get("GROK2API_ADMIN_PASSWORD", "") or ""
         password_file = (os.environ.get("GROK2API_ADMIN_PASSWORD_FILE") or "").strip()
         if not password and password_file:
             password = Path(password_file).read_text(encoding="utf-8").rstrip("\r\n")
+        if not (username and password):
+            config_path = Path(os.environ.get("GROK2API_CONFIG_FILE") or "/run/grok2api/config.yaml")
+            try:
+                with config_path.open("r", encoding="utf-8") as handle:
+                    root = yaml.safe_load(handle) or {}
+                admin = root.get("bootstrapAdmin") or {}
+                username = username or str(admin.get("username") or "").strip()
+                password = password or str(admin.get("password") or "")
+            except (OSError, ValueError) as exc:
+                log_event("admin_config_unreadable", error=str(exc)[:200])
         poll = int(values.get("passive_poll_seconds") or 0)
         return cls(
             base_url=(os.environ.get("GROK2API_BASE_URL") or "http://grok2api:8000").strip(),
@@ -135,7 +149,7 @@ class Config:
             hard_tps=float(values.get("hard_tps") or 0),
             poll_seconds=max(5, min(300, poll or 5)),
             request_timeout_seconds=60,
-            admin_username=(os.environ.get("GROK2API_ADMIN_USERNAME") or "").strip(),
+            admin_username=username,
             admin_password=password,
             provider=(os.environ.get("ACCOUNT_GUARD_PROVIDER") or "grok_build").strip(),
             window_seconds=_env_int("ACCOUNT_GUARD_WINDOW_SECONDS", DEFAULT_WINDOW_SECONDS, 3600, 7 * 86400),

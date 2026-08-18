@@ -20,14 +20,16 @@
 
 ## 配置
 
-全部通过环境变量, 内部凭据与阈值读共享卷中的 `bootstrap.json`(由主程序生成):
+内部凭据与阈值读共享卷中的 `bootstrap.json`(由主程序生成); 管理员凭据默认读挂载的
+`config.yaml` 的 `bootstrapAdmin` 段, 无需额外文件。可调环境变量:
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `GROK2API_BASE_URL` | `http://grok2api:8000` | 主程序内网地址 |
 | `GROK2API_BOOTSTRAP_FILE` | `/var/lib/grok2api-quality-guard/bootstrap.json` | bootstrap 路径 |
-| `GROK2API_ADMIN_USERNAME` | 空 | 管理员用户名; 缺失时只记录不执行 |
-| `GROK2API_ADMIN_PASSWORD_FILE` | 空 | 管理员密码文件(优先于 `GROK2API_ADMIN_PASSWORD`) |
+| `GROK2API_CONFIG_FILE` | `/run/grok2api/config.yaml` | 主程序配置路径 |
+| `GROK2API_ADMIN_USERNAME` | 空 | 可选; 覆盖 config.yaml 中的管理员用户名 |
+| `GROK2API_ADMIN_PASSWORD_FILE` | 空 | 可选; 覆盖 config.yaml 中的管理员密码 |
 | `ACCOUNT_GUARD_WINDOW_SECONDS` | 86400 | 滚动窗口, 3600-604800 |
 | `ACCOUNT_GUARD_MUTE_AFTER` | 3 | 窗口内禁言所需命中数, 2-100 |
 | `ACCOUNT_GUARD_FORCE_SWITCH_ENABLED` | true | 临时摘除开关 |
