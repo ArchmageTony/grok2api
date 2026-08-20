@@ -5,9 +5,9 @@
 
 ## 策略
 
-- 单次降智命中: 临时摘除账号(默认 120 秒), 到期自动恢复; 重复命中顺延, 不重复禁用。
-- 24 小时滚动窗口内累计 3 次命中: 长期禁言, 本守护永不自动恢复, 需要管理员人工处理。
-- 只恢复自己摘除的账号; 不迁移账号, 不清空绑定。
+- 任意一次降智命中: 立即永久禁用该账号, 本守护**永不自动恢复**; 确认误伤后由管理员在账号管理中手动解禁。
+- 不迁移账号, 不清空绑定, 只翻 enabled 开关。
+- 已禁用的账号重复命中只记录日志, 不重复调用禁用。
 
 ## 命中口径
 
@@ -30,10 +30,7 @@
 | `GROK2API_CONFIG_FILE` | `/run/grok2api/config.yaml` | 主程序配置路径 |
 | `GROK2API_ADMIN_USERNAME` | 空 | 可选; 覆盖 config.yaml 中的管理员用户名 |
 | `GROK2API_ADMIN_PASSWORD_FILE` | 空 | 可选; 覆盖 config.yaml 中的管理员密码 |
-| `ACCOUNT_GUARD_WINDOW_SECONDS` | 86400 | 滚动窗口, 3600-604800 |
-| `ACCOUNT_GUARD_MUTE_AFTER` | 3 | 窗口内禁言所需命中数, 2-100 |
-| `ACCOUNT_GUARD_FORCE_SWITCH_ENABLED` | true | 临时摘除开关 |
-| `ACCOUNT_GUARD_FORCE_SWITCH_SECONDS` | 120 | 摘除保持时长, 30-900 |
+| `ACCOUNT_GUARD_WINDOW_SECONDS` | 86400 | 命中计数滚动窗口, 3600-604800 |
 | `ACCOUNT_GUARD_PROVIDER` | `grok_build` | 账号池 |
 
 ## 运行

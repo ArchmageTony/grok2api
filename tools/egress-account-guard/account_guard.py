@@ -2,23 +2,18 @@
 """Standalone degraded-account guard for grok2api.
 
 Reads passive request audits through the quality-guard internal API and
-attributes TPS anomalies to accounts. Strategy mirrors the upstream-side
-enhancement distribution:
-
-- every degrade hit force-switches the account: it is disabled for a short
-  hold (default 120s) so the scheduler picks another account, then restored
-  automatically;
-- 3 hits within a rolling 24h window mute the account long-term; a muted
-  account is never re-enabled by this guard and needs an operator.
+attributes TPS anomalies to accounts. Any degrade hit disables the account
+permanently: this guard never re-enables accounts, and an operator re-enables
+manually after review. Accounts are plentiful; a degraded account hurts more
+than a false mute.
 
 A hit is either the panel-equivalent TPS (including reasoning tokens) crossing
 the soft/hard thresholds, or a completed reply with >= 32 output tokens and
-zero reasoning tokens (missing_thinking). Deployment policy deliberately
-accepts false mutes in exchange for quality: accounts are plentiful.
+zero reasoning tokens (missing_thinking).
 
 The process makes outbound calls only: the internal audit API (quality-guard
-token from bootstrap.json) and the admin API (login with operator-injected
-credentials). It exposes no ports and touches only its own state file.
+token from bootstrap.json) and the admin API (operator-injected credentials).
+It exposes no ports and touches only its own state file.
 """
 
 from __future__ import annotations
@@ -44,19 +39,10 @@ BOOTSTRAP_FILE = Path(os.environ.get("GROK2API_BOOTSTRAP_FILE") or "/var/lib/gro
 STATE_DIR = Path(os.environ.get("ACCOUNT_GUARD_STATE_DIR") or "/var/lib/grok2api-account-guard")
 
 DEFAULT_WINDOW_SECONDS = 24 * 60 * 60
-DEFAULT_MUTE_AFTER = 3
-DEFAULT_FORCE_SWITCH_SECONDS = 120
 MIN_OUTPUT_TOKENS = 32
 MAX_SEEN_AUDIT_IDS = 2000
 PASSIVE_PAGE_SIZE = 200
 PASSIVE_MAX_PAGES = 10
-
-
-def _env_bool(name: str, default: bool) -> bool:
-    raw = os.environ.get(name)
-    if raw is None or not raw.strip():
-        return default
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
@@ -95,9 +81,6 @@ class Config:
     admin_password: str
     provider: str
     window_seconds: int
-    mute_after: int
-    force_switch_enabled: bool
-    force_switch_seconds: int
     state_file: Path
     lock_file: Path
 
@@ -153,9 +136,6 @@ class Config:
             admin_password=password,
             provider=(os.environ.get("ACCOUNT_GUARD_PROVIDER") or "grok_build").strip(),
             window_seconds=_env_int("ACCOUNT_GUARD_WINDOW_SECONDS", DEFAULT_WINDOW_SECONDS, 3600, 7 * 86400),
-            mute_after=_env_int("ACCOUNT_GUARD_MUTE_AFTER", DEFAULT_MUTE_AFTER, 2, 100),
-            force_switch_enabled=_env_bool("ACCOUNT_GUARD_FORCE_SWITCH_ENABLED", True),
-            force_switch_seconds=_env_int("ACCOUNT_GUARD_FORCE_SWITCH_SECONDS", DEFAULT_FORCE_SWITCH_SECONDS, 30, 900),
             state_file=STATE_DIR / "state.json",
             lock_file=STATE_DIR / "guard.lock",
         )
@@ -376,71 +356,23 @@ class AccountGuard:
         entry["last_reason"] = reason
         entry["last_tps"] = round(speed, 3)
         entry["last_at"] = now
-        if len(hits) >= self.config.mute_after and float(entry.get("muted_at") or 0) <= 0:
-            self._mute_account(account_id, reason, len(hits))
 
-    def _mute_account(self, account_id: str, reason: str, hits: int) -> None:
+    def _disable_account(self, account_id: str, reason: str) -> None:
+        """永久禁用降智账号; 本守护永不自动恢复, 由管理员人工解禁。"""
         entry = self._account_entry(account_id)
+        if entry.get("disabled_by_guard") or float(entry.get("muted_at") or 0) > 0:
+            return
         if not self.admin.available:
-            log_event("account_auto_mute_skipped", account_id=account_id, reason=reason, hits=hits, error_type="no_admin_credentials")
+            log_event("account_disable_skipped", account_id=account_id, reason=reason, error_type="no_admin_credentials")
             return
         try:
             updated = self.admin.set_accounts_enabled([account_id], False, self.config.provider)
         except Exception as exc:
-            log_event("account_auto_mute_failed", account_id=account_id, reason=reason, hits=hits, error_type=type(exc).__name__)
+            log_event("account_disable_failed", account_id=account_id, reason=reason, error_type=type(exc).__name__)
             return
-        entry["muted_at"] = time.time()
-        entry.pop("forced_until", None)
-        log_event("account_auto_muted", account_id=account_id, reason=reason, hits=hits, updated=updated)
-
-    def _force_switch(self, account_id: str, reason: str, now: float) -> None:
-        """Temporarily disable a degraded account so the next turn picks another."""
-        if not self.config.force_switch_enabled:
-            return
-        entry = self._account_entry(account_id)
-        if float(entry.get("muted_at") or 0) > 0:
-            return
-        hold = self.config.force_switch_seconds
-        current_until = float(entry.get("forced_until") or 0)
-        if current_until > now:
-            entry["forced_until"] = max(current_until, now + hold)
-            return
-        if not self.admin.available:
-            log_event("account_force_switch_skipped", account_id=account_id, reason=reason, error_type="no_admin_credentials")
-            return
-        try:
-            updated = self.admin.set_accounts_enabled([account_id], False, self.config.provider)
-        except Exception as exc:
-            log_event("account_force_switch_failed", account_id=account_id, reason=reason, error_type=type(exc).__name__)
-            return
-        entry["forced_until"] = now + hold
-        entry["forced_reason"] = reason
-        log_event("account_force_switched", account_id=account_id, reason=reason, hold_seconds=hold, updated=updated)
-
-    def _restore_expired(self, now: float) -> None:
-        accounts = self.state.get("accounts") or {}
-        if not isinstance(accounts, dict):
-            return
-        expired = [
-            (str(account_id), entry)
-            for account_id, entry in accounts.items()
-            if isinstance(entry, dict)
-            and float(entry.get("forced_until") or 0) > 0
-            and float(entry.get("forced_until") or 0) <= now
-        ]
-        if not expired or not self.admin.available:
-            return
-        for account_id, entry in expired:
-            if float(entry.get("muted_at") or 0) > 0:
-                entry.pop("forced_until", None)
-                continue
-            try:
-                updated = self.admin.set_accounts_enabled([account_id], True, self.config.provider)
-            except Exception as exc:
-                log_event("account_force_switch_restore_failed", account_id=account_id, error_type=type(exc).__name__)
-                continue
-            entry.pop("forced_until", None)
-            log_event("account_force_switch_restored", account_id=account_id, updated=updated)
+        entry["disabled_by_guard"] = True
+        entry["disabled_at"] = time.time()
+        log_event("account_disabled", account_id=account_id, reason=reason, hits=len(entry.get("hits") or []), updated=updated)
 
     def _reload_policy(self) -> None:
         """每轮重新读取 bootstrap 与运行时策略, 跟随管理页热保存的阈值。"""
@@ -457,7 +389,6 @@ class AccountGuard:
     def run_cycle(self) -> None:
         self._reload_policy()
         now = time.time()
-        self._restore_expired(now)
         for audit_value in self._fetch_new_audits():
             reason, speed = classify_audit(audit_value, self.config)
             if not reason:
@@ -472,7 +403,7 @@ class AccountGuard:
                 request_id=str(audit_value.get("requestId") or ""),
             )
             self._record_hit(account_id, reason, speed, now)
-            self._force_switch(account_id, reason, now)
+            self._disable_account(account_id, reason)
         self._save_state()
 
     def run(self) -> None:
@@ -482,9 +413,6 @@ class AccountGuard:
             soft_tps=self.config.soft_tps,
             hard_tps=self.config.hard_tps,
             window_seconds=self.config.window_seconds,
-            mute_after=self.config.mute_after,
-            force_switch_enabled=self.config.force_switch_enabled,
-            force_switch_seconds=self.config.force_switch_seconds,
             admin_configured=self.admin.available,
         )
         while True:

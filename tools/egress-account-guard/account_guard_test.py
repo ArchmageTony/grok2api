@@ -29,9 +29,6 @@ def make_config(tmp: str, **overrides) -> account_guard.Config:
         admin_password="",
         provider="grok_build",
         window_seconds=86400,
-        mute_after=3,
-        force_switch_enabled=True,
-        force_switch_seconds=120,
         state_file=Path(tmp) / "state.json",
         lock_file=Path(tmp) / "guard.lock",
     )
@@ -136,50 +133,37 @@ class HitAccountingTest(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def test_force_switch_disables_then_restores_after_hold(self):
-        self.guard._force_switch("7", "hard_tps", self.now)
+    def test_hit_disables_permanently_and_never_restores(self):
+        self.guard._record_hit("7", "hard_tps", 2000.0, self.now)
+        self.guard._disable_account("7", "hard_tps")
         self.assertEqual(self.guard.admin.calls, [(["7"], False, "grok_build")])
-        # hold 未到期不恢复
-        self.guard._restore_expired(self.now + 60)
-        self.assertEqual(len(self.guard.admin.calls), 1)
-        # 到期自动恢复
-        self.guard._restore_expired(self.now + 121)
-        self.assertEqual(self.guard.admin.calls[-1], (["7"], True, "grok_build"))
-
-    def test_force_switch_extends_hold_on_repeat_hit(self):
-        self.guard._force_switch("7", "hard_tps", self.now)
-        self.guard._force_switch("7", "hard_tps", self.now + 30)
-        # 不重复禁用, 只延长
-        self.assertEqual(len(self.guard.admin.calls), 1)
         entry = self.guard.state["accounts"]["7"]
-        self.assertEqual(entry["forced_until"], self.now + 150)
-
-    def test_third_hit_mutes_and_skips_restore(self):
-        for offset in (0, 10, 20):
-            self.guard._record_hit("7", "hard_tps", 2000.0, self.now + offset)
-        entry = self.guard.state["accounts"]["7"]
-        self.assertGreater(entry["muted_at"], 0)
-        # 禁用调用发生
-        self.assertIn((["7"], False, "grok_build"), self.guard.admin.calls)
-        # 已禁言账号不再 force-switch, 也不会被恢复
-        self.guard._force_switch("7", "hard_tps", self.now + 30)
-        self.guard.state["accounts"]["7"]["forced_until"] = self.now + 31
-        self.guard._restore_expired(self.now + 32)
+        self.assertTrue(entry["disabled_by_guard"])
+        # 不存在任何恢复路径: 后续命中不重复禁用, 也没有解禁调用
+        self.guard._record_hit("7", "hard_tps", 2000.0, self.now + 1000)
+        self.guard._disable_account("7", "hard_tps")
+        self.assertEqual(len(self.guard.admin.calls), 1)
         self.assertNotIn((["7"], True, "grok_build"), self.guard.admin.calls)
 
-    def test_hits_older_than_window_do_not_count(self):
+    def test_previously_muted_accounts_are_not_redisabled(self):
+        # 旧版状态里 muted_at 的账号同样视为已禁用。
+        self.guard.state["accounts"]["7"] = {"muted_at": self.now - 100}
+        self.guard._disable_account("7", "hard_tps")
+        self.assertEqual(self.guard.admin.calls, [])
+
+    def test_hits_older_than_window_are_pruned(self):
         self.guard._record_hit("7", "hard_tps", 2000.0, self.now - 100000)
         self.guard._record_hit("7", "hard_tps", 2000.0, self.now - 90000)
         self.guard._record_hit("7", "hard_tps", 2000.0, self.now)
         entry = self.guard.state["accounts"]["7"]
         self.assertEqual(len(entry["hits"]), 1)
-        self.assertEqual(float(entry.get("muted_at") or 0), 0)
 
     def test_no_admin_credentials_only_logs(self):
         self.guard.admin = FakeAdmin(available=False)
-        for offset in (0, 10, 20):
-            self.guard._record_hit("7", "hard_tps", 2000.0, self.now + offset)
+        self.guard._record_hit("7", "hard_tps", 2000.0, self.now)
+        self.guard._disable_account("7", "hard_tps")
         self.assertEqual(self.guard.admin.calls, [])
+        self.assertFalse(self.guard.state["accounts"]["7"].get("disabled_by_guard", False))
 
     def test_state_roundtrip(self):
         self.guard._record_hit("7", "hard_tps", 2000.0, self.now)
